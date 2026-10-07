@@ -115,7 +115,8 @@ impl ProjectService {
 
     /// Upsert a whole project from a backup. Incoming wins on conflict (mirrors Android
     /// `importBackup`); `created_at` is preserved on an existing row.
-    pub async fn upsert(pool: &SqlitePool, input: crate::models::ImportProject) -> Result<()> {
+    pub async fn upsert<'a, E>(pool: E, input: crate::models::ImportProject) -> Result<()>
+    where E: sqlx::Executor<'a, Database = sqlx::Sqlite> {
         let now = Utc::now().to_rfc3339();
         let language = normalize_project_language(input.language.as_deref());
         let status = input.status.unwrap_or_else(|| "draft".to_string());

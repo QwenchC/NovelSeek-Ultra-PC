@@ -1,5 +1,7 @@
 import { create } from 'zustand';
-import { persist, createJSONStorage, type StateStorage } from 'zustand/middleware';
+import { persist, type PersistStorage } from 'zustand/middleware';
+import type { WritingArchive, WritingWorkspace, WritingUsageEntry } from '../writing/models';
+import type { SessionMetrics } from '../agent/agentPolicy';
 import type {
   Chapter,
   EmbeddingConfig,
@@ -53,6 +55,7 @@ function idbSet(key: string, value: string): Promise<void> {
         tx.objectStore(IDB_STORE).put(value, key);
         tx.oncomplete = () => resolve();
         tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error || new Error('IndexedDB transaction aborted'));
       })
   );
 }
@@ -65,56 +68,95 @@ function idbDel(key: string): Promise<void> {
         tx.objectStore(IDB_STORE).delete(key);
         tx.oncomplete = () => resolve();
         tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error || new Error('IndexedDB transaction aborted'));
       })
   );
 }
 
-const idbStorage: StateStorage = {
+// Debounced, deferred persistence. zustand's persist calls setItem after EVERY `set`, and the default
+// JSON storage serializes the WHOLE persisted blob synchronously. Our blob is image-heavy (character
+// portraits, chapter promo images, agent steps), so a synchronous JSON.stringify on every state change
+// — e.g. the several store writes a page navigation triggers — janks the UI badly.
+//
+// This storage defers + coalesces the expensive serialize: setItem just records the latest value and
+// schedules a single flush (≤600ms later, off the interaction). A pagehide/visibilitychange flush makes
+// sure the last write isn't lost when the window closes. getItem stays synchronous-read (idb → legacy
+// localStorage) and returns the parsed object.
+let pendingPersist: { name: string; value: unknown } | null = null;
+let persistTimer: ReturnType<typeof setTimeout> | null = null;
+// Serialize asynchronous IDB writes: a late old debounce must never overwrite an imported snapshot.
+let persistWriteQueue: Promise<void> = Promise.resolve();
+function queuedIdbSet(name: string, serialized: string): Promise<void> {
+  const write = persistWriteQueue.then(() => idbSet(name, serialized));
+  persistWriteQueue = write.catch(() => undefined);
+  return write;
+}
+
+function flushPersist(): void {
+  if (persistTimer) {
+    clearTimeout(persistTimer);
+    persistTimer = null;
+  }
+  if (!pendingPersist) return;
+  const { name, value } = pendingPersist;
+  pendingPersist = null;
+  let serialized: string;
+  try {
+    serialized = JSON.stringify(value);
+  } catch (e) {
+    console.error('[store] serialize failed:', e);
+    return;
+  }
+  queuedIdbSet(name, serialized)
+    .then(() => {
+      // Free the old localStorage copy once data lives in IndexedDB.
+      try { localStorage.removeItem(name); } catch { /* ignore */ }
+    })
+    .catch((e) => {
+      console.warn('[store] IndexedDB set failed, falling back to localStorage:', e);
+      try { localStorage.setItem(name, serialized); } catch (e2) { console.error('[store] persist failed (quota?):', e2); }
+    });
+}
+
+const debouncedIdbStorage: PersistStorage<unknown> = {
   getItem: async (name) => {
+    let str: string | null = null;
     try {
-      const v = await idbGet(name);
-      if (v != null) return v;
+      str = await idbGet(name);
     } catch (e) {
       console.warn('[store] IndexedDB get failed:', e);
     }
     // One-time migration: read the legacy localStorage value if IndexedDB is empty.
+    if (str == null) {
+      try { str = localStorage.getItem(name); } catch { str = null; }
+    }
+    if (str == null) return null;
     try {
-      return localStorage.getItem(name);
+      return JSON.parse(str);
     } catch {
       return null;
     }
   },
-  setItem: async (name, value) => {
-    try {
-      await idbSet(name, value);
-      // Free the old localStorage copy (and its quota) once data lives in IndexedDB.
-      try {
-        localStorage.removeItem(name);
-      } catch {
-        /* ignore */
-      }
-    } catch (e) {
-      console.warn('[store] IndexedDB set failed, falling back to localStorage:', e);
-      try {
-        localStorage.setItem(name, value);
-      } catch (e2) {
-        console.error('[store] persist failed (quota?):', e2);
-      }
-    }
+  setItem: (name, value) => {
+    // Coalesce: record the latest snapshot; the first write in a burst schedules one flush.
+    pendingPersist = { name, value };
+    if (!persistTimer) persistTimer = setTimeout(flushPersist, 600);
   },
   removeItem: async (name) => {
-    try {
-      await idbDel(name);
-    } catch {
-      /* ignore */
-    }
-    try {
-      localStorage.removeItem(name);
-    } catch {
-      /* ignore */
-    }
+    if (pendingPersist && pendingPersist.name === name) pendingPersist = null;
+    try { await idbDel(name); } catch { /* ignore */ }
+    try { localStorage.removeItem(name); } catch { /* ignore */ }
   },
 };
+
+// Never lose the last debounced write when the window closes or is hidden.
+if (typeof window !== 'undefined') {
+  window.addEventListener('pagehide', flushPersist);
+  window.addEventListener('beforeunload', flushPersist);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') flushPersist();
+  });
+}
 
 export interface Character {
   id: string;
@@ -520,6 +562,19 @@ export interface AgentSession {
 export interface AgentSessionMeta { id: string; title: string; createdAt: string }
 
 interface AppState {
+  // Android-compatible, additive archives. Unknown Android fields live in backupExtensions.
+  writingWorkspaceByProject: Record<string, WritingWorkspace>;
+  writingUsageByProject: Record<string, WritingUsageEntry[]>;
+  sceneWritingByProject: Record<string, WritingArchive>;
+  generationRunsByProject: Record<string, unknown[]>;
+  backupExtensions: Record<string, unknown>;
+  agentEngine: 'legacy' | 'structured';
+  agentReasoningLevel: 'low' | 'medium' | 'high';
+  agentContextBudget: number;
+  agentSessionMetrics: Record<string, SessionMetrics>;
+  agentSessionContextSummaries: Record<string, string>;
+  /** Import/recovery guard; deliberately not persisted. */
+  backupImportPending: boolean;
   projects: Project[];
   currentProject: Project | null;
   setProjects: (projects: Project[]) => void;
@@ -739,6 +794,17 @@ const initialActiveProfile = pickActiveProfile(initialProfiles, DEFAULT_ACTIVE_P
 export const useAppStore = create<AppState>()(
   persist(
     (set, get) => ({
+      writingWorkspaceByProject: {},
+      writingUsageByProject: {},
+      sceneWritingByProject: {},
+      generationRunsByProject: {},
+      backupExtensions: {},
+      agentEngine: 'legacy',
+      agentReasoningLevel: 'medium',
+      agentContextBudget: 32_000,
+      agentSessionMetrics: {},
+      agentSessionContextSummaries: {},
+      backupImportPending: false,
       projects: [],
       currentProject: null,
       setProjects: (projects) => set({ projects }),
@@ -1472,9 +1538,19 @@ export const useAppStore = create<AppState>()(
     }),
     {
       name: 'novelseek-storage',
-      storage: createJSONStorage(() => idbStorage),
-      version: 12,
+      storage: debouncedIdbStorage as PersistStorage<AppState>,
+      version: 14,
       partialize: (state) => ({
+        writingWorkspaceByProject: state.writingWorkspaceByProject,
+        writingUsageByProject: state.writingUsageByProject,
+        sceneWritingByProject: state.sceneWritingByProject,
+        generationRunsByProject: state.generationRunsByProject,
+        backupExtensions: state.backupExtensions,
+        agentEngine: state.agentEngine,
+        agentReasoningLevel: state.agentReasoningLevel,
+        agentContextBudget: state.agentContextBudget,
+        agentSessionMetrics: state.agentSessionMetrics,
+        agentSessionContextSummaries: state.agentSessionContextSummaries,
         textModelConfig: state.textModelConfig,
         textModelProfiles: state.textModelProfiles,
         activeTextModelProfileId: state.activeTextModelProfileId,
@@ -1488,8 +1564,9 @@ export const useAppStore = create<AppState>()(
         theme: state.theme,
         uiLanguage: state.uiLanguage,
         folders: state.folders,
-        openProjectTabs: state.openProjectTabs,
-        tabPathByProject: state.tabPathByProject,
+        // NOTE: openProjectTabs / tabPathByProject are deliberately NOT persisted — tabs reset each
+        // launch (per request), and persisting them made every navigation re-serialize the whole
+        // image-heavy store blob (a major page-switch jank source).
         novelTypeByProject: state.novelTypeByProject,
         plotArcsByProject: state.plotArcsByProject,
         longNovelOutlineByProject: state.longNovelOutlineByProject,
@@ -1513,6 +1590,22 @@ export const useAppStore = create<AppState>()(
       migrate: (persistedState: any, version) => {
         if (!persistedState || typeof persistedState !== 'object') {
           return persistedState;
+        }
+
+        if (version < 13) {
+          // Tabs are no longer persisted — drop any leftover copy so old blobs don't restore them once.
+          delete persistedState.openProjectTabs;
+          delete persistedState.tabPathByProject;
+        }
+
+        if (version < 14) {
+          for (const field of ['writingWorkspaceByProject', 'writingUsageByProject', 'sceneWritingByProject',
+            'generationRunsByProject', 'backupExtensions', 'agentSessionMetrics', 'agentSessionContextSummaries']) {
+            if (!persistedState[field] || typeof persistedState[field] !== 'object' || Array.isArray(persistedState[field])) persistedState[field] = {};
+          }
+          if (persistedState.agentEngine !== 'structured') persistedState.agentEngine = 'legacy';
+          if (!['low', 'medium', 'high'].includes(persistedState.agentReasoningLevel)) persistedState.agentReasoningLevel = 'medium';
+          if (!Number.isFinite(persistedState.agentContextBudget) || persistedState.agentContextBudget < 2000) persistedState.agentContextBudget = 32_000;
         }
 
         if (version < 2) {
@@ -1668,3 +1761,33 @@ export const useAppStore = create<AppState>()(
     }
   )
 );
+
+let importMetadataQueue: Promise<void> = Promise.resolve();
+/** Writing checkpoints must be durable before the next provider request begins. */
+export function flushWritingPersistence(): Promise<void> {
+  if (persistTimer) { clearTimeout(persistTimer); persistTimer = null; }
+  pendingPersist = null;
+  const options = useAppStore.persist.getOptions();
+  const current = useAppStore.getState();
+  const state = options.partialize ? options.partialize(current) : current;
+  return queuedIdbSet(options.name || 'novelseek-storage', JSON.stringify({ state, version: options.version ?? 14 }));
+}
+/** Strict commit used after SQLite's recovery journal has committed. Never falls back silently. */
+export function persistImportedBackupMetadata(patch: Record<string, unknown>): Promise<void> {
+  const operation = importMetadataQueue.then(async () => {
+    if (persistTimer) { clearTimeout(persistTimer); persistTimer = null; }
+    flushPersist();
+    await persistWriteQueue;
+    const options = useAppStore.persist.getOptions();
+    const merged = { ...useAppStore.getState(), ...patch } as AppState;
+    const state = options.partialize ? options.partialize(merged) : merged;
+    // Validate/serialize before publishing state. The native journal is retained if IDB fails.
+    await queuedIdbSet(options.name || 'novelseek-storage', JSON.stringify({ state, version: options.version ?? 14 }));
+    if (persistTimer) { clearTimeout(persistTimer); persistTimer = null; }
+    pendingPersist = null;
+    useAppStore.setState(patch as Partial<AppState>);
+    try { localStorage.removeItem(options.name || 'novelseek-storage'); } catch { /* legacy cleanup only */ }
+  });
+  importMetadataQueue = operation.catch(() => undefined);
+  return operation;
+}

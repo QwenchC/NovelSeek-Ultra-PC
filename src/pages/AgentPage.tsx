@@ -1,4 +1,5 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { useAppStore } from '@store/index';
 import type { AgentStep } from '@store/index';
 import { Button } from '@components/Button';
@@ -12,6 +13,9 @@ import { tx } from '@utils/i18n';
 import { uiPrompt, uiConfirm, uiAlert } from '@components/uiDialog';
 import { agentRunner } from '../agent/agentRunner';
 import { useAgentStream } from '../agent/agentStream';
+import { getWorkspaceCandidates } from '../writingUi/workspaceRuntime';
+import { WorkspaceCandidateReview } from '../writingUi/WorkspaceCandidateReview';
+import type { AgentPlan } from '../agent/agentPolicy';
 
 type Step = AgentStep;
 
@@ -25,9 +29,11 @@ export function AgentPage() {
     agentStatus, agentRunSessionId, agentPendingConfirm,
     ensureAgentSession, newAgentSession, switchAgentSession, deleteAgentSession,
     renameAgentSession, patchAgentSession, getAgentSession,
-    agentMaxSteps, setAgentMaxSteps,
+    agentMaxSteps, setAgentMaxSteps, agentEngine, agentReasoningLevel, agentSessionMetrics,
   } = useAppStore();
   const agentStreamingText = useAgentStream((st) => st.text);
+  const navigate = useNavigate();
+  const [reviewTarget, setReviewTarget] = useState<{ projectId: string; candidateId: string; sessionId: string } | null>(null);
 
   const [input, setInput] = useState('');
   const [showSessions, setShowSessions] = useState(false);
@@ -93,6 +99,17 @@ export function AgentPage() {
   }, [streamingText]);
 
   const focusedTitle = focusId ? (projects.find((p) => p.id === focusId)?.title ?? focusId) : null;
+  const metrics = cur ? agentSessionMetrics[cur] : undefined;
+  const contextRatio = metrics?.contextBudget ? Math.max(0, Math.min(1, metrics.contextTokens / metrics.contextBudget)) : 0;
+  let waitingCandidateId: string | undefined;
+  if (viewStatus === 'awaiting_confirm' && !agentPendingConfirm) {
+    for (const step of [...steps].reverse()) {
+      if (step.role !== 'result') continue;
+      try { const marker = JSON.parse(step.content); if (marker.resultKind === 'pending_review' && typeof marker.candidateId === 'string') { waitingCandidateId = marker.candidateId; break; } } catch { /* ordinary tool result */ }
+    }
+  }
+  const sessionCandidates = projects.flatMap(project => getWorkspaceCandidates(project.id).filter(candidate => (candidate.status === 'pending' || candidate.id === waitingCandidateId) && candidate.sessionId === cur));
+  const plan = (session as (typeof session & { activePlan?: AgentPlan }))?.activePlan;
 
   const submit = () => {
     const t = input.trim();
@@ -147,7 +164,7 @@ export function AgentPage() {
   return (
     <div className="w-full flex flex-col h-[calc(100vh-7rem)]">
       {/* Header */}
-      <div className="flex items-center gap-3 mb-3 flex-shrink-0">
+      <div className="flex items-center gap-3 mb-3 flex-shrink-0 flex-wrap">
         <div className="w-9 h-9 rounded-full bg-purple-100 dark:bg-purple-900/30 flex items-center justify-center">
           <Bot className="w-5 h-5 text-purple-600 dark:text-purple-400" />
         </div>
@@ -223,6 +240,18 @@ export function AgentPage() {
           </button>
         )}
       </div>
+
+      <div className="flex flex-wrap gap-3 items-center text-xs mb-3 flex-shrink-0">
+        <label className="flex items-center gap-2">{tx(uiLanguage, '智能体引擎', 'Agent engine')}<select disabled={running} value={agentEngine} onChange={e => useAppStore.setState({ agentEngine: e.target.value as 'legacy' | 'structured' })} className="border rounded px-2 py-1 dark:bg-gray-800 dark:border-gray-600"><option value="legacy">{tx(uiLanguage, '经典执行链', 'Classic')}</option><option value="structured">{tx(uiLanguage, '规划执行引擎', 'Plan and execute')}</option></select></label>
+        {focusId && <Button size="sm" variant="outline" onClick={() => navigate(`/workbench/${focusId}`)}>{tx(uiLanguage, '本书工作台', 'Book workbench')}</Button>}
+        <div className="ml-auto flex items-center gap-2" title={tx(uiLanguage, '上下文占用为本地估算；接近上限时自动压缩，压缩后保留可追溯会话。', 'Context is a local estimate. Near the limit it is compressed while preserving the conversation.')}>
+          <svg viewBox="0 0 40 40" className="w-9 h-9 -rotate-90" role="img" aria-label={tx(uiLanguage, `上下文占用${Math.round(contextRatio * 100)}%`, `Context ${Math.round(contextRatio * 100)}%`)}><circle cx="20" cy="20" r="16" fill="none" stroke="currentColor" strokeWidth="4" className="text-gray-200 dark:text-gray-700" /><circle cx="20" cy="20" r="16" fill="none" stroke="currentColor" strokeWidth="4" pathLength="100" strokeDasharray={`${contextRatio * 100} 100`} className={contextRatio > 0.9 ? 'text-amber-500' : 'text-purple-500'} /></svg>
+          <span>{tx(uiLanguage, '上下文', 'Context')} {Math.round(contextRatio * 100)}%<span className="block text-gray-500">{metrics ? `${metrics.contextTokens.toLocaleString()}/${metrics.contextBudget.toLocaleString()}` : tx(uiLanguage, '尚无统计', 'No data')}</span></span>
+        </div>
+        <span className="text-gray-500">{tx(uiLanguage, '会话缓存命中', 'Session cache hit')} {metrics?.promptTokens && metrics.measuredRequests ? `${Math.round(metrics.cacheHitTokens / metrics.promptTokens * 100)}%` : tx(uiLanguage, '未返回统计', 'Unavailable')}<span className="block">{metrics ? `${metrics.measuredRequests} ${tx(uiLanguage, '已统计', 'measured')} · ${metrics.unknownRequests} ${tx(uiLanguage, '未知', 'unknown')}` : ''}</span></span>
+        {metrics?.compressedAt && <details><summary className="cursor-pointer text-purple-600">{tx(uiLanguage, '上下文已压缩', 'Context compressed')}</summary><p className="max-w-xl max-h-32 overflow-auto whitespace-pre-wrap mt-2">{metrics.summary}</p></details>}
+      </div>
+      {!!sessionCandidates.length && <div className="mb-2 rounded-xl border border-purple-200 dark:border-purple-800 p-3 flex-shrink-0 max-h-40 overflow-auto space-y-2">{sessionCandidates.map(candidate => <div key={candidate.id} className="flex justify-between gap-3 items-center"><span className="text-sm">{candidate.title} · {candidate.status === 'pending' ? tx(uiLanguage, '正文候选待审核，尚未写入章节', 'Candidate awaiting review, not adopted') : tx(uiLanguage, '审核已处理，等待确认结果', 'Review processed; confirmation pending')}</span><Button size="sm" onClick={() => { if (cur) setReviewTarget({ projectId: candidate.projectId, candidateId: candidate.id, sessionId: cur }); }}>{tx(uiLanguage, '预览与审核', 'Preview and review')}</Button></div>)}</div>}
 
       {/* Background-run banner when viewing a different session */}
       {otherRunning && (
@@ -314,11 +343,12 @@ export function AgentPage() {
       )}
 
       {/* Input — stays enabled while running so you can inject instructions at any time */}
+      {plan && <details className="mt-2 rounded-xl border border-purple-200 dark:border-purple-800 px-3 py-2 flex-shrink-0"><summary className="cursor-pointer text-sm text-purple-700 dark:text-purple-300">{tx(uiLanguage, '项目执行计划', 'Project execution plan')} · {plan.steps.filter(step => step.status === 'completed').length}/{plan.steps.length}</summary><p className="text-xs text-gray-500 my-2">{plan.summary}</p><ol className="max-h-48 overflow-y-auto space-y-2 text-sm">{plan.steps.map((step, index) => <li key={step.id} className="flex gap-2"><span>{step.status === 'completed' ? '✓' : step.status === 'in_progress' ? '▶' : step.status === 'blocked' ? '!' : '○'}</span><div><p>{index + 1}. {step.goal}</p>{step.successCriteria && <p className="text-xs text-gray-500">{step.successCriteria}</p>}</div></li>)}</ol></details>}
       <div className="mt-3 flex gap-2 flex-shrink-0">
         <textarea
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); } }}
+          onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) { e.preventDefault(); submit(); } }}
           rows={2}
           disabled={otherRunning}
           placeholder={
@@ -329,6 +359,7 @@ export function AgentPage() {
           }
           className="flex-1 px-3 py-2 border rounded-xl dark:bg-gray-800 dark:border-gray-600 resize-none focus:outline-none focus:ring-2 focus:ring-purple-500 text-sm disabled:opacity-60"
         />
+        <label className="text-xs flex flex-col justify-center gap-1 text-gray-500">{tx(uiLanguage, '推理级别', 'Reasoning')}<select value={agentReasoningLevel} onChange={e => useAppStore.setState({ agentReasoningLevel: e.target.value as 'low' | 'medium' | 'high' })} className="border rounded px-2 py-2 dark:bg-gray-800 dark:border-gray-600"><option value="low">{tx(uiLanguage, '低', 'Low')}</option><option value="medium">{tx(uiLanguage, '中', 'Medium')}</option><option value="high">{tx(uiLanguage, '高', 'High')}</option></select></label>
         {running && viewStatus !== 'awaiting_user' ? (
           <div className="flex flex-col gap-1">
             <Button onClick={() => agentRunner.stop()} variant="outline" className="px-4 text-red-600 border-red-300">
@@ -344,6 +375,7 @@ export function AgentPage() {
           </Button>
         )}
       </div>
+      {reviewTarget && <WorkspaceCandidateReview projectId={reviewTarget.projectId} candidateId={reviewTarget.candidateId} onClose={() => setReviewTarget(null)} onReviewed={async () => { setReviewTarget(null); }} />}
     </div>
   );
 }

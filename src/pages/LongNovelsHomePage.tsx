@@ -134,7 +134,7 @@ export function LongNovelsHomePage() {
               volumeCount={(volumesByProject[project.id] || []).length}
               chapterCount={chapterCounts[project.id] ?? null}
               uiLanguage={uiLanguage}
-              onClick={() => navigate(`/long-novel/${project.id}`)}
+              onClick={() => navigate(`/workbench/${project.id}`)}
               onDelete={() => handleDeleteProject(project.id)}
             />
           ))}
@@ -147,7 +147,7 @@ export function LongNovelsHomePage() {
           onSuccess={(projectId) => {
             setShowCreateModal(false);
             setNovelType(projectId, 'long');
-            navigate(`/long-novel/${projectId}`);
+            navigate(`/workbench/${projectId}`);
           }}
         />
       )}

@@ -10,6 +10,7 @@ function activeProjectIdFromPath(pathname: string): string | null {
   const m =
     pathname.match(/^\/long-novel\/([^/]+)/) ||
     pathname.match(/^\/project\/([^/]+)/) ||
+    pathname.match(/^\/workbench\/([^/]+)/) ||
     pathname.match(/^\/editor\/([^/]+)/);
   return m ? m[1] : null;
 }
@@ -57,8 +58,7 @@ export function Topbar() {
   const [dragId, setDragId] = useState<string | null>(null);
   const [menu, setMenu] = useState<{ x: number; y: number; id: string } | null>(null);
 
-  const projectPath = (id: string) =>
-    (novelTypeByProject[id] || 'short') === 'long' ? `/long-novel/${id}` : `/project/${id}`;
+  const projectPath = (id: string) => `/workbench/${id}`;
   const homePathFor = (id: string) =>
     (novelTypeByProject[id] || 'short') === 'long' ? '/long-novels' : '/short-novels';
   // Where a tab reopens: its last-visited sub-page (e.g. the chapter editor), else the landing page.

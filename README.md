@@ -1,10 +1,12 @@
 # NovelSeek Ultra PC
 
 [![Built with Pollinations](https://img.shields.io/badge/Built%20with-Pollinations-8a2be2?style=for-the-badge&logo=data:image/svg+xml,%3Csvg%20xmlns%3D%22http://www.w3.org/2000/svg%22%20viewBox%3D%220%200%20124%20124%22%3E%3Ccircle%20cx%3D%2262%22%20cy%3D%2262%22%20r%3D%2262%22%20fill%3D%22%23ffffff%22/%3E%3C/svg%3E&logoColor=white&labelColor=6a0dad)](https://enter.pollinations.ai/)
-![version](https://img.shields.io/badge/version-2.0.1-8a2be2?style=for-the-badge)
+![version](https://img.shields.io/badge/version-2.1.0-8a2be2?style=for-the-badge)
 ![platform](https://img.shields.io/badge/platform-Windows-0a7bbb?style=for-the-badge)
 
 [English README](README.en.md)
+
+2.1.0 新增场景写作工作台、故事卡、候选审核、双智能体模式与长文本导入出版，功能对应 Android 1.6.0。参阅 [更新说明](docs/RELEASE_NOTES_2.1.0.md) 和 [两端数据交换说明](docs/DATA_INTERCHANGE.md)。互通通过 ZIP／JSON 手动备份完成，不是实时云同步；跨端旧任务和候选不会自动执行。
 
 **NovelSeek Ultra PC** 是一款面向**长篇小说**创作的桌面工具，把「项目 → 副本 → 剧情弧线 → 章节」的结构化创作流程、本地知识库（RAG）、自演化容器知识库、修炼境界体系、可后台运行的写作智能体（Agent）整合到一个离线应用里。基于 `Tauri + React + TypeScript + Rust + SQLite`，数据本地持久化；其备份格式与手机端 **NovelSeek-Ultra** 完全互通，可无损互导。
 

@@ -91,7 +91,8 @@ impl ChapterService {
     /// Upsert a whole chapter (metadata + text bodies + illustrations + arc_id) from a backup.
     /// Incoming wins on conflict (mirrors Android `importBackup` merge semantics). Does NOT
     /// recompute project word counts — callers recompute once per project after a bulk import.
-    pub async fn upsert(pool: &SqlitePool, input: crate::models::ImportChapter) -> Result<()> {
+    pub async fn upsert<'a, E>(pool: E, input: crate::models::ImportChapter) -> Result<()>
+    where E: sqlx::Executor<'a, Database = sqlx::Sqlite> {
         let now = Utc::now().to_rfc3339();
         let created_at = input.created_at.unwrap_or_else(|| now.clone());
         let updated_at = input.updated_at.unwrap_or_else(|| now.clone());
@@ -111,9 +112,9 @@ impl ChapterService {
                 conflict = excluded.conflict,
                 twist = excluded.twist,
                 cliffhanger = excluded.cliffhanger,
-                draft_text = excluded.draft_text,
-                final_text = excluded.final_text,
-                illustrations = excluded.illustrations,
+                draft_text = COALESCE(excluded.draft_text, chapters.draft_text),
+                final_text = COALESCE(excluded.final_text, chapters.final_text),
+                illustrations = COALESCE(excluded.illustrations, chapters.illustrations),
                 word_count = excluded.word_count,
                 status = excluded.status,
                 updated_at = excluded.updated_at,

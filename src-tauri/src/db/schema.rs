@@ -2,6 +2,10 @@ use sqlx::{SqlitePool, Row};
 use anyhow::Result;
 
 pub async fn run_migrations(pool: &SqlitePool) -> Result<()> {
+    // Durable bridge between SQLite content and the frontend metadata store. Never overwrite
+    // an unacknowledged import: the frontend must recover it before the next import.
+    sqlx::query("CREATE TABLE IF NOT EXISTS backup_metadata_outbox (singleton INTEGER PRIMARY KEY CHECK(singleton = 1), revision TEXT NOT NULL, metadata_json TEXT NOT NULL)")
+        .execute(pool).await?;
     // Enable foreign keys
     sqlx::query("PRAGMA foreign_keys = ON;")
         .execute(pool)

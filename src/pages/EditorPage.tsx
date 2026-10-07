@@ -1,5 +1,6 @@
 ﻿import { useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom';
+import { WorkspaceChapterEntry } from '../writingUi/WorkspaceChapterEntry';
 import { useAppStore } from '@store/index';
 import { chapterApi, projectApi, knowledgeApi } from '@services/api';
 import { Button } from '@components/Button';
@@ -1022,6 +1023,7 @@ export function EditorPage() {
             <ArrowLeft className="w-4 h-4 mr-2" />
             {tx(uiLanguage, '返回', 'Back')}
           </Button>
+          {projectId && <WorkspaceChapterEntry projectId={projectId} chapterId={chapter?.id} canReview={isSaved && !isGenerating && !isSaving} onReviewed={accepted => { if (accepted) void loadChapterData(); }} />}
           <div ref={chapterSwitcherRef} className="min-w-0 relative">
             <h2 className="text-xl font-semibold text-gray-900 dark:text-white truncate">
               <button

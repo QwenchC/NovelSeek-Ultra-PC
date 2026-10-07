@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
+import { WorkspaceChapterEntry } from '../writingUi/WorkspaceChapterEntry';
 import { useAppStore } from '@store/index';
 import type { PlotArc } from '@store/index';
 import { chapterApi, knowledgeApi } from '@services/api';
@@ -1403,6 +1404,15 @@ export function LongNovelEditorPage() {
           <>
             {/* Editor toolbar */}
             <div className="flex items-center gap-2 px-4 py-2 border-b border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800 flex-shrink-0">
+              {id && <WorkspaceChapterEntry projectId={id} chapterId={chapter.id} canReview={isSaved && !isGenerating && !isSaving} onReviewed={accepted => {
+                if (!accepted) return;
+                void chapterApi.getByProject(id).then(list => {
+                  setAllChapters(list.sort((a, b) => a.order_index - b.order_index));
+                  const fresh = list.find(c => c.id === chapter.id); if (!fresh) return;
+                  const body = fresh.final_text || fresh.draft_text || '';
+                  setEditorDraftContent(fresh.id, body, false); setChapter(fresh); setContent(body); setIsSaved(true);
+                }).catch(failure => setError(String(failure)));
+              }} />}
               <div className="flex-1 min-w-0">
                 <h2 className="font-semibold text-gray-900 dark:text-white truncate">{chapter.title}</h2>
                 <button

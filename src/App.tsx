@@ -18,16 +18,19 @@ import { NovelQaPage } from '@pages/NovelQaPage';
 import { SnapshotsPage } from '@pages/SnapshotsPage';
 import { AgentPage } from '@pages/AgentPage';
 import { ListenPage } from '@pages/ListenPage';
+import { WritingWorkbenchPage } from '@pages/WritingWorkbenchPage';
+import { BackupRecoveryGate } from '@components/BackupRecoveryGate';
 
 function App() {
   return (
     <Router>
-      <Layout>
+      <BackupRecoveryGate><Layout>
         <Routes>
           {/* App launches on the long-novel page by default. */}
           <Route path="/" element={<Navigate to="/long-novels" replace />} />
           <Route path="/short-novels" element={<HomePage />} />
           <Route path="/long-novels" element={<LongNovelsHomePage />} />
+          <Route path="/workbench/:id" element={<WritingWorkbenchPage />} />
           <Route path="/long-novel/:id" element={<LongNovelPage />} />
           <Route path="/long-novel/:id/outline" element={<LongNovelOutlinePage />} />
           <Route path="/long-novel/:id/editor/:chapterId?" element={<LongNovelEditorPage />} />
@@ -45,7 +48,7 @@ function App() {
           <Route path="/agent" element={<AgentPage />} />
           <Route path="/settings" element={<SettingsPage />} />
         </Routes>
-      </Layout>
+      </Layout></BackupRecoveryGate>
     </Router>
   );
 }

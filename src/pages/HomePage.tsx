@@ -131,7 +131,7 @@ export function HomePage() {
               key={project.id}
               project={project}
               uiLanguage={uiLanguage}
-              onClick={() => navigate(`/project/${project.id}`)}
+              onClick={() => navigate(`/workbench/${project.id}`)}
               onDelete={() => handleDeleteProject(project.id)}
             />
           ))}
@@ -144,7 +144,7 @@ export function HomePage() {
           onSuccess={(novelType, projectId) => {
             setShowCreateModal(false);
             if (novelType === 'long') {
-              navigate(`/long-novel/${projectId}`);
+              navigate(`/workbench/${projectId}`);
             } else {
               loadProjects();
             }

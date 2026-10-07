@@ -1,6 +1,10 @@
 pub mod project;
 pub mod chapter;
 pub mod content;
+pub mod backup;
+pub mod scoped_ai;
+pub mod writing;
+pub mod illustration;
 pub mod snapshot;
 pub mod tts;
 pub mod ai;

@@ -281,6 +281,42 @@ pub async fn generate_character_appearance(
     })
 }
 
+/// Tolerantly extract the `image_prompt` field from a model reply: strict JSON first, then any
+/// embedded `{...}` object. Returns `None` for an empty / unparseable reply so callers fall back
+/// gracefully instead of failing the whole image generation.
+fn extract_image_prompt_field(content: &str) -> Option<String> {
+    let cleaned = content
+        .trim()
+        .trim_start_matches("```json")
+        .trim_start_matches("```")
+        .trim_end_matches("```")
+        .trim();
+    if cleaned.is_empty() {
+        return None;
+    }
+    let pick = |v: &serde_json::Value| {
+        v["image_prompt"]
+            .as_str()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    if let Ok(v) = serde_json::from_str::<serde_json::Value>(cleaned) {
+        if let Some(s) = pick(&v) {
+            return Some(s);
+        }
+    }
+    if let (Some(a), Some(b)) = (cleaned.find('{'), cleaned.rfind('}')) {
+        if b > a {
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&cleaned[a..=b]) {
+                if let Some(s) = pick(&v) {
+                    return Some(s);
+                }
+            }
+        }
+    }
+    None
+}
+
 #[tauri::command]
 pub async fn generate_character_portrait_prompt(
     input: GenerateCharacterPortraitPromptInput,
@@ -290,6 +326,8 @@ pub async fn generate_character_portrait_prompt(
     let api_url = input.text_config.chat_completions_url();
     let temperature = input.text_config.normalized_temperature(0.6);
     let style = input.style.unwrap_or_default();
+    // Kept for a graceful fallback if the text model returns an empty / non-JSON reply (see below).
+    let appearance_for_fallback = input.appearance.clone().unwrap_or_default();
 
     let prompt = format!(
         r#"你是专业的 AI 人像提示词工程师。请基于以下信息，生成一条用于人物“一寸证件照”风格的英文提示词。
@@ -354,27 +392,28 @@ pub async fn generate_character_portrait_prompt(
 
     let content = response_json["choices"][0]["message"]["content"]
         .as_str()
-        .ok_or("无法获取 AI 响应内容")?;
-
-    let cleaned_content = content
-        .trim()
-        .trim_start_matches("```json")
-        .trim_start_matches("```")
-        .trim_end_matches("```")
-        .trim();
-
-    let result: serde_json::Value = serde_json::from_str(cleaned_content)
-        .map_err(|e| format!("解析 AI 返回 JSON 失败: {}。原始内容: {}", e, cleaned_content))?;
-
-    let image_prompt = result["image_prompt"]
-        .as_str()
-        .unwrap_or("studio portrait, one-inch ID photo, clean background, realistic, high detail")
+        .unwrap_or("")
         .trim()
         .to_string();
 
-    if image_prompt.is_empty() {
-        return Err("AI 未返回有效的人像提示词".to_string());
-    }
+    // Be resilient: some text models (reasoning models especially, or under a tight max_tokens) return
+    // an EMPTY or non-JSON `content` — which previously failed with "EOF while parsing a value at line 1
+    // column 0" and blocked portrait generation entirely. Instead, fall back to a sensible prompt built
+    // from the character's own appearance + the chosen style so the image engine still runs.
+    let image_prompt = extract_image_prompt_field(&content).unwrap_or_else(|| {
+        let mut parts = vec![
+            "studio portrait, one-inch ID photo headshot, clean background, soft lighting, realistic, high detail".to_string(),
+        ];
+        let ap = appearance_for_fallback.trim();
+        if !ap.is_empty() {
+            parts.push(ap.to_string());
+        }
+        let st = style.trim();
+        if !st.is_empty() {
+            parts.push(st.to_string());
+        }
+        parts.join(", ")
+    });
 
     Ok(CharacterPortraitPromptResult { image_prompt })
 }

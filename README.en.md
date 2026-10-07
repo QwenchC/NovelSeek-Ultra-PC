@@ -15,8 +15,10 @@ Built with `Tauri + React + TypeScript + Rust + SQLite`, it runs fully local wit
 
 ## Version
 
-- Current version: `v1.4.0`
+- Current version: `v2.1.0`
 - Primary platform: Windows
+
+Version 2.1.0 adds the Android 1.6.0 scene-writing workbench, story notes, source-bound candidate review, planner/executor mode, manuscript import, EPUB/DOCX export and checksummed ZIP interchange. See [release notes](docs/RELEASE_NOTES_2.1.0.md) and [data interchange](docs/DATA_INTERCHANGE.md). Interchange is a manual backup workflow, not real-time cloud synchronization. Foreign tasks and candidate approvals are never automatically replayed.
 
 ## Feature Overview
 

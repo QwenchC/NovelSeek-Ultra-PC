@@ -8,18 +8,21 @@ import { CONTAINER_SINGLE_BLOCK_KEY } from '@store/index';
 import { projectApi, chapterApi, aiApi, knowledgeApi, snapshotApi } from '@services/api';
 import type { Chapter, TextModelConfig, EmbeddingConfig, CreateProjectInput } from '@typings/index';
 import { invoke } from '@tauri-apps/api/tauri';
-import { listen } from '@tauri-apps/api/event';
 import { generateVolumes, generateArcsForVolume } from '@utils/volumeAi';
-import { buildGenerationGuidance, runChapterAutoUpdates } from '@utils/containerAi';
+import { buildGenerationGuidance } from '@utils/containerAi';
 import { buildSnapshotContent, restoreSnapshot } from '@utils/snapshots';
 import { buildRealmSystemContext, buildVolumeRealmConstraint } from '@utils/cultivation';
-import { stripChapterHeading } from '@utils/index';
+import { readTextRange, searchText } from '../writing';
+import { generateWorkspaceChapter, latestWorkspaceCheckpoint, getWorkspaceCandidates } from '../writingUi/workspaceRuntime';
 import { useAgentStream } from './agentStream';
+import { proposeAgentBody } from './agentWriting';
 
 type Lang = 'zh' | 'en';
 type Args = Record<string, any>;
 
 export interface AgentToolCtx {
+  signal?: AbortSignal;
+  sessionId?: string;
   getFocusId: () => string | null;
   setFocusId: (id: string | null) => void;
   textConfig: TextModelConfig;
@@ -53,35 +56,16 @@ async function refreshProjects() {
 }
 
 function parseJsonObject(raw: string): Record<string, any> {
-  const c = raw.replace(/```(?:json)?/gi, '').trim();
-  const a = c.indexOf('{'), b = c.lastIndexOf('}');
-  if (a < 0 || b <= a) return {};
-  try { return JSON.parse(c.slice(a, b + 1)); } catch { return {}; }
-}
-/** Extract complete top-level {...} objects from a (possibly truncated) blob. */
-function extractJsonObjects(text: string): any[] {
-  const out: any[] = [];
-  let depth = 0, start = -1, inStr = false, esc = false;
-  for (let i = 0; i < text.length; i++) {
-    const ch = text[i];
-    if (inStr) {
-      if (esc) esc = false; else if (ch === '\\') esc = true; else if (ch === '"') inStr = false;
-      continue;
-    }
-    if (ch === '"') inStr = true;
-    else if (ch === '{') { if (depth === 0) start = i; depth++; }
-    else if (ch === '}') { if (depth > 0) depth--; if (depth === 0 && start >= 0) { try { out.push(JSON.parse(text.slice(start, i + 1))); } catch { /* skip */ } start = -1; } }
-  }
-  return out;
+  let value: unknown;
+  try { value = JSON.parse(raw.trim()); } catch { throw new Error('模型输出不是完整纯JSON对象，请缩小单次任务或重试；未导入部分内容'); }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('模型应输出JSON对象');
+  return value as Record<string, any>;
 }
 function parseJsonArray(raw: string): any[] {
-  const c = raw.replace(/```(?:json)?/gi, '').trim();
-  const a = c.indexOf('['), b = c.lastIndexOf(']');
-  if (a >= 0 && b > a) {
-    try { const arr = JSON.parse(c.slice(a, b + 1)); if (Array.isArray(arr) && arr.length) return arr; } catch { /* truncated — recover objects below */ }
-  }
-  // Tolerant fallback: recover whatever complete {...} objects exist (handles truncated arrays).
-  return extractJsonObjects(c);
+  let value: unknown;
+  try { value = JSON.parse(raw.trim()); } catch { throw new Error('模型JSON数组被截断或带有说明；未采用不完整结果，请分批执行'); }
+  if (!Array.isArray(value) || !value.length) throw new Error('模型未返回非空JSON数组');
+  return value;
 }
 
 function findChar(pid: string, ident: string): Character | undefined {
@@ -447,11 +431,13 @@ export const AGENT_TOOLS: AgentTool[] = [
     const text = ch.final_text || ch.draft_text || '';
     return `第${ch.order_index}章《${ch.title}》目标：${ch.outline_goal || '无'}\n正文节选：${text.slice(0, 500) || '（空）'}`;
   }},
-  { name: 'read_chapter', desc: '读取某章完整正文（用于定位局部修改）。args: projectId?, chapterId', run: async (a, ctx) => {
+  { name: 'read_chapter', desc: '分页读取正文，nextOffset继续读；可按字面query搜索。args: projectId?, chapterId, offset?(UTF16位置), limit?(<=12000), query?', run: async (a, ctx) => {
     const pid = resolvePid(a, ctx);
     const ch = (await chapterApi.getByProject(pid)).find((c) => c.id === a.chapterId);
     if (!ch) throw new Error('章节不存在');
-    return ch.final_text || ch.draft_text || '（空）';
+    const text = ch.final_text || ch.draft_text || '';
+    return JSON.stringify(a.query ? searchText([{ id: ch.id, title: ch.title, kind: 'chapter', text }], String(a.query), { offset: Number(a.offset ?? 0), limit: Number(a.limit ?? 10) })
+      : { chapterId: ch.id, ...readTextRange(text, Number(a.offset ?? 0), Number(a.limit ?? 8000)) });
   }},
   { name: 'list_paragraphs', desc: '列出某章各段落（带序号，便于定位）。args: projectId?, chapterId', run: async (a, ctx) => {
     const pid = resolvePid(a, ctx);
@@ -460,65 +446,24 @@ export const AGENT_TOOLS: AgentTool[] = [
     const paras = (ch.final_text || ch.draft_text || '').split(/\n\s*\n+/).map((p) => p.trim()).filter(Boolean);
     return paras.map((p, i) => `[${i + 1}] ${p.slice(0, 80)}`).join('\n') || '（空）';
   }},
-  { name: 'generate_chapter', desc: '为某章生成正文。args: projectId?, chapterId', sensitive: true, run: async (a, ctx) => {
+  { name: 'generate_chapter', desc: '按本书工作台模式生成候选正文（快速/场景/精修），待用户在会话内审核采用后才写入正文。args: projectId?, chapterId, resume?(仅本会话同一任务中断时true)', sensitive: true, run: async (a, ctx) => {
     const pid = resolvePid(a, ctx);
-    const chs = await chapterApi.getByProject(pid);
-    const ch = chs.find((c) => c.id === a.chapterId);
-    if (!ch) throw new Error('章节不存在');
-    const { world, charInfo } = chapterContext(pid, ctx, chs);
-    // Respect this chapter's own 副本/弧线 ownership (not just the globally-active arc).
-    const arcCtx = buildChapterArcContext(pid, ch);
-    const worldFull = [arcCtx, world].filter((x) => x && x.trim()).join('\n\n');
-    const prev = chs.filter((c) => c.order_index < ch.order_index && (c.final_text || c.draft_text)).sort((x, y) => y.order_index - x.order_index)[0];
-    // Stream the generation into the ephemeral (non-persisted) store so the session shows a live
-    // bubble. chapter-stream emits DELTAS — append them. Throttle UI updates (~16/s) to keep the
-    // main thread free; never route this through the persisted store (it would write IndexedDB per
-    // token and freeze/crash the app).
-    const setStream = (t: string) => useAgentStream.getState().set(t);
-    setStream('');
-    let acc = '';
-    let flushTimer: ReturnType<typeof setTimeout> | null = null;
-    const scheduleFlush = () => {
-      if (flushTimer) return;
-      flushTimer = setTimeout(() => { flushTimer = null; setStream(acc); }, 60);
-    };
-    const unlisten = await listen<string>('chapter-stream', (e) => { acc += (e.payload as string) || ''; scheduleFlush(); });
-    let text = '';
+    const checkpoint = a.resume === true ? latestWorkspaceCheckpoint(pid, String(a.chapterId)) : null;
+    if (a.resume === true && (!checkpoint || !ctx.sessionId || !getWorkspaceCandidates(pid).some(candidate => candidate.runId === checkpoint.runId && candidate.sessionId === ctx.sessionId))) {
+      throw new Error('没有本会话对应的中断任务；外来或其他会话草稿不能自动续写');
+    }
+    const stream = useAgentStream.getState();
+    let accumulated = ''; let timer: ReturnType<typeof setTimeout> | null = null;
     try {
-      text = await invoke<string>('generate_chapter_stream', {
-        chapterTitle: ch.title,
-        outlineGoal: ch.outline_goal || '',
-        conflict: ch.conflict || '',
-        previousSummary: prev ? (prev.final_text || prev.draft_text || '').slice(-1500) : null,
-        currentContent: null,
-        chapterList: null,
-        charactersInfo: charInfo || null,
-        worldSetting: worldFull || null,
-        timeline: null,
-        targetWords: 2500,
-        isContinuation: false,
-        outputLanguage: ctx.uiLanguage === 'en' ? 'en' : 'zh',
-        textConfig: ctx.textConfig,
+      stream.set('');
+      const record = await generateWorkspaceChapter(pid, String(a.chapterId), {
+        signal: ctx.signal, initiator: 'agent', sessionId: ctx.sessionId,
+        resumeRunId: checkpoint?.runId,
+        onDelta: delta => { accumulated += delta; if (!timer) timer = setTimeout(() => { timer = null; stream.set(accumulated); }, 60); },
       });
-    } finally {
-      unlisten();
-      if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
-      setStream('');
-    }
-    if (!text || !text.trim()) text = acc;
-    text = stripChapterHeading(text, ch.title);
-    await chapterApi.update(ch.id, text, text, undefined);
-    await refreshProjects();
-    // Auto-mark arc 进度（未开始/进行中/已完成）from the new chapter content.
-    await syncArcStatuses(pid);
-    // Per-chapter container/growth auto-update (same as the editor's save flow). Fire-and-forget.
-    if (text.trim().length > 200) {
-      runChapterAutoUpdates({
-        projectId: pid, chapterId: ch.id, chapterOrder: ch.order_index, chapterTitle: ch.title,
-        chapterText: text, textConfig: ctx.textConfig, uiLanguage: ctx.uiLanguage,
-      }).catch((e) => console.warn('[Container/Growth] agent auto-update failed:', e));
-    }
-    return `第${ch.order_index}章《${ch.title}》已生成（${text.replace(/\s/g, '').length} 字）。节选：${text.slice(0, 150)}…`;
+      return JSON.stringify({ resultKind: 'pending_review', projectId: pid, chapterId: record.chapterId,
+        runId: record.runId, candidateId: record.candidateId, message: '候选正文已完成，等待用户审核；尚未提交正文。' });
+    } finally { if (timer) clearTimeout(timer); stream.set(''); }
   }},
   { name: 'revise_chapter', desc: '按要求润色/修改某章正文（整章重写）。args: projectId?, chapterId, instruction', sensitive: true, run: async (a, ctx) => {
     const pid = resolvePid(a, ctx);
@@ -526,16 +471,7 @@ export const AGENT_TOOLS: AgentTool[] = [
     if (!ch) throw new Error('章节不存在');
     const cur = ch.final_text || ch.draft_text || '';
     if (!cur.trim()) throw new Error('该章暂无正文');
-    const out = await aiApi.generateRevision({ text: cur, goals: a.instruction || '润色并保持原意', text_config: ctx.textConfig });
-    await chapterApi.update(ch.id, out, out, undefined);
-    await refreshProjects();
-    if (out.trim().length > 200) {
-      runChapterAutoUpdates({
-        projectId: pid, chapterId: ch.id, chapterOrder: ch.order_index, chapterTitle: ch.title,
-        chapterText: out, textConfig: ctx.textConfig, uiLanguage: ctx.uiLanguage,
-      }).catch((e) => console.warn('[Container/Growth] agent auto-update failed:', e));
-    }
-    return `第${ch.order_index}章已按要求修改`;
+    return proposeAgentBody(pid, ch, ctx, String(a.instruction || '润色并保持原意'), true);
   }},
   { name: 'replace_in_chapter', desc: '局部修改：把某章正文中的一段原文精确替换为新文本。args: projectId?, chapterId, find, replace(留空=删除)', sensitive: true, run: async (a, ctx) => {
     const pid = resolvePid(a, ctx);
@@ -544,9 +480,7 @@ export const AGENT_TOOLS: AgentTool[] = [
     const cur = ch.final_text || ch.draft_text || '';
     if (!a.find || !cur.includes(a.find)) throw new Error('未在正文中找到要替换的片段（需逐字一致）');
     const next = cur.replace(a.find, a.replace ?? '');
-    await chapterApi.update(ch.id, next, next, undefined);
-    await refreshProjects();
-    return '已局部替换';
+    return proposeAgentBody(pid, ch, ctx, next);
   }},
   { name: 'edit_paragraph', desc: '局部修改：用新文本替换某章第 N 段（按非空行计数）。args: projectId?, chapterId, paragraphIndex(从1), newText', sensitive: true, run: async (a, ctx) => {
     const pid = resolvePid(a, ctx);
@@ -558,9 +492,7 @@ export const AGENT_TOOLS: AgentTool[] = [
     if (idx < 0 || idx >= paras.length) throw new Error('段落序号超出范围');
     paras[idx] = String(a.newText ?? '');
     const next = paras.join('\n\n');
-    await chapterApi.update(ch.id, next, next, undefined);
-    await refreshProjects();
-    return `已替换第 ${a.paragraphIndex} 段`;
+    return proposeAgentBody(pid, ch, ctx, next);
   }},
   { name: 'update_chapter', desc: '修改章节标题/目标/冲突。args: projectId?, chapterId, title?, goal?, conflict?', run: async (a, ctx) => {
     const pid = resolvePid(a, ctx);
@@ -876,11 +808,11 @@ export const AGENT_TOOLS: AgentTool[] = [
     await refreshProjects();
     return `已删除项目《${p.title}》`;
   }},
-  { name: 'get_outline', desc: '查看完整大纲文本。args: projectId?', run: async (a, ctx) => {
+  { name: 'get_outline', desc: '分页读取大纲，nextOffset继续读。args: projectId?, offset?, limit?(<=12000), query?', run: async (a, ctx) => {
     const pid = resolvePid(a, ctx);
     const o = s().getLongNovelOutline(pid);
-    if (!o.trim()) return '（暂无大纲）';
-    return o.length > 2500 ? o.slice(0, 2500) + `\n…（已截断，共 ${o.length} 字）` : o;
+    return JSON.stringify(a.query ? searchText([{ id: pid, title: '大纲', kind: 'outline', text: o }], String(a.query), { offset: Number(a.offset ?? 0), limit: Number(a.limit ?? 10) })
+      : { projectId: pid, ...readTextRange(o, Number(a.offset ?? 0), Number(a.limit ?? 8000)) });
   }},
   { name: 'set_outline', desc: '直接写入/覆盖大纲文本。args: projectId?, text', sensitive: true, run: async (a, ctx) => {
     const pid = resolvePid(a, ctx);
@@ -892,10 +824,7 @@ export const AGENT_TOOLS: AgentTool[] = [
     const ch = (await chapterApi.getByProject(pid)).find((c) => c.id === a.chapterId);
     if (!ch) throw new Error('章节不存在');
     const text = String(a.text ?? '');
-    await chapterApi.update(ch.id, text, text, undefined);
-    await refreshProjects();
-    await syncArcStatuses(pid);
-    return `已写入正文（${text.replace(/\s/g, '').length} 字）`;
+    return proposeAgentBody(pid, ch, ctx, text);
   }},
 
   // ── Realms (append / delete) ──
@@ -1085,7 +1014,12 @@ export const AGENT_TOOLS: AgentTool[] = [
     let arr: any[] = [];
     try { arr = ch.illustrations ? JSON.parse(ch.illustrations) : []; if (!Array.isArray(arr)) arr = []; } catch { arr = []; }
     arr.push({ id: uid('ill'), anchorIndex: anchor, paragraphIndices: [anchor], prompt, imageBase64: dataUrl, createdAt: new Date().toISOString() });
-    await chapterApi.update(ch.id, body, body, JSON.stringify(arr));
+    if (ctx.signal?.aborted) throw new DOMException('任务已停止，未写入插图', 'AbortError');
+    await invoke('update_chapter_illustrations', { input: {
+      projectId: pid, chapterId: ch.id, expectedDraft: ch.draft_text || '',
+      expectedFinal: ch.final_text || '', expectedIllustrations: ch.illustrations || '',
+      illustrations: JSON.stringify(arr),
+    } });
     await refreshProjects();
     ctx.pushImage?.((ctx.uiLanguage === 'en' ? `Illustration · ¶${anchor}` : `第${anchor}段插图`), dataUrl);
     return `已生成并插入段落插图（锚定第 ${anchor} 段）`;

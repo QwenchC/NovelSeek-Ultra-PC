@@ -1,7 +1,9 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useAppStore } from '@store/index';
 import { aiApi, chapterApi, knowledgeApi, projectApi } from '@services/api';
-import type { ImportChapterFull } from '@services/api';
+import { readBackup, writeBackupJson, writeBackupZip, type BackupBundle } from '../backup/archive';
+import { buildBackupBundle, prepareBackupImport, summarizeBackup, type BackupSummary } from '../backup/bridge';
+import { importBackupAtomically, recoverPendingBackupMetadata } from '../backup/service';
 import { Button } from '@components/Button';
 import { uiConfirm, uiAlert } from '@components/uiDialog';
 import type {
@@ -31,156 +33,6 @@ import {
 import { tx } from '@utils/i18n';
 
 type Status = 'idle' | 'testing' | 'success' | 'error';
-
-// ── Backup / Restore types ────────────────────────────────────
-
-const BACKUP_VERSION = 1;
-
-// Per-project maps are detected dynamically (any state/backup key ending in `ByProject`) so new
-// mechanisms are picked up automatically — matches the Android `AppRepository.importBackup`
-// approach. These keys are excluded from the generic merge:
-//  - KB caches / summaries: re-indexable, live in SQLite on PC.
-//  - novelChatsByProject: round-tripped under the Android-compatible top-level `novelChats` key.
-//  - chaptersByProject: chapter metadata is consumed by the SQLite content-import path, not the store.
-const EXCLUDED_BY_PROJECT_KEYS = new Set([
-  'kbIndexHashByProject',
-  'kbStaleByProject',
-  'summariesByProject',
-  'novelChatsByProject',
-  'chaptersByProject',
-]);
-
-function collectByProjectKeys(obj: Record<string, unknown>): string[] {
-  return Object.keys(obj).filter(
-    (k) => k.endsWith('ByProject') && !EXCLUDED_BY_PROJECT_KEYS.has(k)
-  );
-}
-
-// ── Image base64 convention bridging ──────────────────────────
-// PC renders <img src={...}> directly, so it stores FULL data URLs ("data:image/...;base64,xxx").
-// Android stores RAW base64 (decoded to a Bitmap). Convert at the import/export boundary so images
-// display on PC and round-trip back to Android.
-function toDataUrl(b: string): string {
-  return b.startsWith('data:') ? b : `data:image/png;base64,${b}`;
-}
-function toRawBase64(b: string): string {
-  return b.startsWith('data:') ? b.replace(/^data:[^;,]*;base64,/, '') : b;
-}
-
-/** Walk the image-bearing fields of a backup `data` object and convert base64 in place. */
-function normalizeBackupImages(data: Record<string, any>, mode: 'toDataUrl' | 'toRaw'): void {
-  const fix = mode === 'toDataUrl' ? toDataUrl : toRawBase64;
-  const fixField = (obj: any, key: string) => {
-    if (obj && typeof obj[key] === 'string' && obj[key]) obj[key] = fix(obj[key]);
-  };
-  // Character portraits.
-  const chars = data.charactersByProject;
-  if (chars && typeof chars === 'object') {
-    for (const arr of Object.values(chars)) {
-      if (Array.isArray(arr)) for (const c of arr) fixField(c, 'portraitBase64');
-    }
-  }
-  // Chapter promo images.
-  const promo = data.promoByChapter;
-  if (promo && typeof promo === 'object') {
-    for (const p of Object.values(promo)) fixField(p, 'imageBase64');
-  }
-  // Inline chapter illustrations.
-  const illus = data.chapterIllustrations;
-  if (illus && typeof illus === 'object') {
-    for (const arr of Object.values(illus)) {
-      if (Array.isArray(arr)) for (const it of arr) fixField(it, 'imageBase64');
-    }
-  }
-  // Project covers (cover_images is a JSON string of { imageBase64 } items).
-  if (Array.isArray(data.projects)) {
-    for (const p of data.projects) {
-      if (p && typeof p.cover_images === 'string' && p.cover_images) {
-        try {
-          const items = JSON.parse(p.cover_images);
-          if (Array.isArray(items)) {
-            for (const it of items) fixField(it, 'imageBase64');
-            p.cover_images = JSON.stringify(items);
-          }
-        } catch {
-          /* ignore malformed cover_images */
-        }
-      }
-    }
-  }
-}
-
-const APP_SETTINGS_FIELDS = [
-  'textModelProfiles',
-  'activeTextModelProfileId',
-  'textModelConfig',
-  'pollinationsKey',
-  'imageEngine',
-  'comfyUIUrl',
-  'embeddingConfig',
-  'knowledgeBaseEnabled',
-  'summariesEnabled',
-  'entitiesEnabled',
-  'theme',
-  'uiLanguage',
-] as const;
-
-interface BackupBundle {
-  version: number;
-  exportedAt: string;
-  appVersion?: string;
-  data: Record<string, unknown>;
-}
-
-interface BackupSummary {
-  projectIdsInBackup: number;
-  projectIdsInStore: number;
-  projectIdsOverlap: number;
-  chapterPromosInBackup: number;
-  hasAppSettings: boolean;
-}
-
-/** Collect distinct project ids: from any `*ByProject` map's keys plus an explicit `projects[]`. */
-function collectProjectIds(obj: Record<string, unknown>): Set<string> {
-  const ids = new Set<string>();
-  for (const key of collectByProjectKeys(obj)) {
-    const m = obj[key];
-    if (m && typeof m === 'object') {
-      for (const k of Object.keys(m as Record<string, unknown>)) ids.add(k);
-    }
-  }
-  const projects = obj.projects;
-  if (Array.isArray(projects)) {
-    for (const p of projects) {
-      const id = (p as { id?: string })?.id;
-      if (typeof id === 'string') ids.add(id);
-    }
-  }
-  return ids;
-}
-
-function summarizeBackup(file: BackupBundle, currentState: any): BackupSummary {
-  const inIds = collectProjectIds(file.data);
-  const curIds = collectProjectIds(currentState);
-  let overlap = 0;
-  inIds.forEach((id) => {
-    if (curIds.has(id)) overlap += 1;
-  });
-
-  const promosIn = file.data.promoByChapter
-    ? Object.keys(file.data.promoByChapter as Record<string, unknown>).length
-    : 0;
-
-  const hasAppSettings = APP_SETTINGS_FIELDS.some((k) => k in file.data);
-
-  return {
-    projectIdsInBackup: inIds.size,
-    projectIdsInStore: curIds.size,
-    projectIdsOverlap: overlap,
-    chapterPromosInBackup: promosIn,
-    hasAppSettings,
-  };
-}
 
 const CUSTOM_MODEL_DEFAULT: Pick<TextModelProfile, 'provider' | 'apiUrl' | 'model' | 'temperature'> = {
   provider: 'custom',
@@ -311,6 +163,11 @@ export function SettingsPage() {
   // Backup / Restore state
   const [backupStatus, setBackupStatus] = useState('');
   const [isImporting, setIsImporting] = useState(false);
+  const [isExporting, setIsExporting] = useState(false);
+  const [isReadingBackup, setIsReadingBackup] = useState(false);
+  const [backupFormat, setBackupFormat] = useState<'zip' | 'json'>('zip');
+  const [exportIncludeSecrets, setExportIncludeSecrets] = useState(false);
+  const backupImportPending = useAppStore(state => state.backupImportPending);
   const [importPreview, setImportPreview] = useState<{
     file: BackupBundle;
     fileName: string;
@@ -670,136 +527,48 @@ export function SettingsPage() {
 
   // ── Backup / Restore handlers ───────────────────────────────
 
+  const stateForBackup = () => useAppStore.getState() as unknown as Record<string, unknown>;
   const handleExportBackup = async () => {
-    const state = useAppStore.getState() as any;
-    const data: Record<string, unknown> = {};
-
-    // All per-project maps (incl. new mechanisms ported from Android: containers / volumes /
-    // character growth) — detected dynamically so future maps are picked up automatically.
-    for (const k of collectByProjectKeys(state)) {
-      const v = state[k];
-      if (v && typeof v === 'object' && Object.keys(v).length > 0) data[k] = v;
-    }
-    if (state.promoByChapter && Object.keys(state.promoByChapter).length > 0) {
-      data.promoByChapter = state.promoByChapter;
-    }
-    if (Array.isArray(state.folders) && state.folders.length > 0) {
-      data.folders = state.folders;
-    }
-    for (const k of APP_SETTINGS_FIELDS) {
-      if (state[k] !== undefined) data[k] = state[k];
-    }
-
-    // Novel-chat history → Android-compatible top-level `novelChats` (pid → messages[]).
-    if (state.novelChatsByProject && Object.keys(state.novelChatsByProject).length > 0) {
-      data.novelChats = state.novelChatsByProject;
-    }
-
-    // Full novel content from SQLite, split into the Android `buildBackupBundle` shape:
-    //   projects[] + chaptersByProject{} (metadata) + chapterBodies{} + chapterIllustrations{}
-    // so the file restores completely on a fresh device and is importable on Android too.
+    if (isExporting || isImporting || backupImportPending) return;
+    if (exportIncludeSecrets && !await uiConfirm({ title: tx(uiLanguage, '导出敏感信息', 'Export sensitive information'), message: tx(uiLanguage,
+      '此次备份将包含 API 密钥。请仅保存到可信位置，确认继续？',
+      'This backup will contain API keys. Save it only to a trusted location. Continue?') })) return;
+    setIsExporting(true);
+    setBackupStatus(tx(uiLanguage, '正在读取完整书库并生成备份…', 'Reading the full library and preparing backup…'));
     try {
+      // No metadata-only fallback: a failed content read must stop the export visibly.
       const content = await projectApi.exportContent();
-      if (content.projects.length > 0) data.projects = content.projects;
-
-      const chaptersByProject: Record<string, unknown[]> = {};
-      const chapterBodies: Record<string, { draft: string; final: string }> = {};
-      const chapterIllustrations: Record<string, unknown[]> = {};
-
-      for (const c of content.chapters) {
-        (chaptersByProject[c.project_id] ||= []).push({
-          id: c.id,
-          project_id: c.project_id,
-          title: c.title,
-          order_index: c.order_index,
-          outline_goal: c.outline_goal ?? null,
-          conflict: c.conflict ?? null,
-          twist: c.twist ?? null,
-          cliffhanger: c.cliffhanger ?? null,
-          word_count: c.word_count,
-          status: c.status,
-          created_at: c.created_at,
-          updated_at: c.updated_at,
-          arcId: c.arc_id ?? null,
-        });
-        if ((c.draft_text && c.draft_text.length > 0) || (c.final_text && c.final_text.length > 0)) {
-          chapterBodies[c.id] = { draft: c.draft_text || '', final: c.final_text || '' };
-        }
-        if (c.illustrations) {
-          try {
-            const arr = JSON.parse(c.illustrations);
-            if (Array.isArray(arr) && arr.length > 0) chapterIllustrations[c.id] = arr;
-          } catch {
-            /* ignore malformed illustrations JSON */
-          }
-        }
-      }
-      if (Object.keys(chaptersByProject).length > 0) data.chaptersByProject = chaptersByProject;
-      if (Object.keys(chapterBodies).length > 0) data.chapterBodies = chapterBodies;
-      if (Object.keys(chapterIllustrations).length > 0) {
-        data.chapterIllustrations = chapterIllustrations;
-      }
-    } catch (err) {
-      console.warn('[Backup] export novel content failed (metadata still exported):', err);
-    }
-
-    const bundle: BackupBundle = {
-      version: BACKUP_VERSION,
-      exportedAt: new Date().toISOString(),
-      appVersion: '2.0.1',
-      data,
-    };
-
-    // Deep-clone (decouple from live store), then convert images to RAW base64 — the format the
-    // Android app expects — so the file imports correctly on Android too.
-    const fileBundle = JSON.parse(JSON.stringify(bundle)) as BackupBundle;
-    normalizeBackupImages(fileBundle.data, 'toRaw');
-
-    const json = JSON.stringify(fileBundle, null, 2);
-    const blob = new Blob([json], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    const stamp = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
-    a.download = `novelseek-backup-${stamp}.json`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-
-    setBackupStatus(
-      tx(uiLanguage, '已导出到浏览器下载目录。', 'Exported to your downloads folder.')
-    );
+      const bundle = buildBackupBundle(stateForBackup(), content, exportIncludeSecrets);
+      const blob = backupFormat === 'zip' ? await writeBackupZip(bundle) : writeBackupJson(bundle);
+      const url = URL.createObjectURL(blob), link = document.createElement('a');
+      link.href = url;
+      link.download = `novelseek-backup-${new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19)}.${backupFormat}`;
+      document.body.appendChild(link); link.click(); link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      setBackupStatus(tx(uiLanguage, '已导出完整书库（含正文、插图、智能体会话及双端兼容数据）。', 'Full library exported, including text, illustrations, agent sessions and compatible extensions.'));
+    } catch (error) {
+      setBackupStatus(tx(uiLanguage, `导出失败，未生成不完整备份：${String(error)}`, `Export failed; no incomplete backup was created: ${String(error)}`));
+    } finally { setIsExporting(false); }
   };
 
   const handleImportPickFile = () => {
+    if (isReadingBackup || isImporting || isExporting || backupImportPending) return;
     setBackupStatus('');
     const input = document.createElement('input');
-    input.type = 'file';
-    input.accept = '.json,application/json';
+    input.type = 'file'; input.accept = '.zip,.json,application/zip,application/json';
     input.onchange = async () => {
-      const file = input.files?.[0];
-      if (!file) return;
+      const selected = input.files?.[0]; if (!selected) return;
+      setIsReadingBackup(true);
+      setBackupStatus(tx(uiLanguage, '正在校验备份大小、结构及附件摘要…', 'Validating size, structure and attachment checksums…'));
       try {
-        const text = await file.text();
-        const parsed = JSON.parse(text) as BackupBundle;
-        if (!parsed || typeof parsed !== 'object' || !parsed.data || typeof parsed.data !== 'object') {
-          throw new Error('Not a valid backup file');
-        }
-        if (parsed.version !== BACKUP_VERSION) {
-          // Allow but warn — fields may have evolved
-          console.warn('[Backup] version mismatch:', parsed.version);
-        }
-        const summary = summarizeBackup(parsed, useAppStore.getState());
-        setImportPreview({ file: parsed, fileName: file.name, summary });
-        setImportIncludeAppSettings(false);
-      } catch (err) {
-        console.error('[Backup] import parse failed:', err);
-        setBackupStatus(
-          tx(uiLanguage, `导入失败：文件无法解析。${String(err)}`,
-            `Import failed: cannot parse file. ${String(err)}`)
-        );
-      }
+        const parsed = await readBackup(selected);
+        // Fully validate detached import data before displaying a confirmation or doing any writes.
+        prepareBackupImport(parsed, stateForBackup(), false);
+        setImportPreview({ file: parsed, fileName: selected.name, summary: summarizeBackup(parsed, stateForBackup()) });
+        setImportIncludeAppSettings(false); setBackupStatus('');
+      } catch (error) {
+        setBackupStatus(tx(uiLanguage, `导入校验失败，书库未改动：${String(error)}`, `Import validation failed; the library is unchanged: ${String(error)}`));
+      } finally { setIsReadingBackup(false); }
     };
     input.click();
   };
@@ -807,139 +576,32 @@ export function SettingsPage() {
   const handleConfirmImport = async () => {
     if (!importPreview || isImporting) return;
     setIsImporting(true);
-    setBackupStatus(tx(uiLanguage, '正在导入…', 'Importing…'));
-    // Whole body is guarded so any failure surfaces a message instead of silently doing nothing.
+    setBackupStatus(tx(uiLanguage, '正在原子导入书库并保存元数据…', 'Atomically importing the library and saving metadata…'));
     try {
-      const incoming = importPreview.file.data;
-      // Android stores raw base64; PC renders data URLs. Convert image fields in place (the parsed
-      // backup object is discarded after import, so mutating it is safe).
-      normalizeBackupImages(incoming, 'toDataUrl');
-      const state = useAppStore.getState() as any;
-      const next: Record<string, unknown> = {};
-
-      // Per-project maps (incl. new mechanisms): merge by key, import wins on conflict.
-      for (const k of collectByProjectKeys(incoming)) {
-        const inc = incoming[k];
-        if (inc && typeof inc === 'object') {
-          next[k] = { ...(state[k] || {}), ...(inc as Record<string, unknown>) };
-        }
-      }
-      // promoByChapter: merge by chapter id, import wins.
-      if (incoming.promoByChapter && typeof incoming.promoByChapter === 'object') {
-        next.promoByChapter = {
-          ...(state.promoByChapter || {}),
-          ...(incoming.promoByChapter as Record<string, unknown>),
-        };
-      }
-
-      // Folders: merge by id, import wins.
-      if (Array.isArray(incoming.folders)) {
-        const map = new Map<string, unknown>();
-        for (const f of (state.folders as { id: string }[]) || []) {
-          if (f && typeof f === 'object' && f.id) map.set(f.id, f);
-        }
-        for (const f of incoming.folders as { id: string }[]) {
-          if (f && typeof f === 'object' && f.id) map.set(f.id, f);
-        }
-        next.folders = Array.from(map.values());
-      }
-
-      // Novel-chat history (Android top-level `novelChats`, pid → messages[]): merge by project.
-      if (incoming.novelChats && typeof incoming.novelChats === 'object') {
-        next.novelChatsByProject = {
-          ...(state.novelChatsByProject || {}),
-          ...(incoming.novelChats as Record<string, unknown>),
-        };
-      }
-
-      // App settings — only if user opted in.
-      if (importIncludeAppSettings) {
-        if (Array.isArray(incoming.textModelProfiles)) {
-          const map = new Map<string, unknown>();
-          for (const p of (state.textModelProfiles as { id: string }[]) || []) {
-            if (p && typeof p === 'object' && p.id) map.set(p.id, p);
-          }
-          for (const p of incoming.textModelProfiles as { id: string }[]) {
-            if (p && typeof p === 'object' && p.id) map.set(p.id, p);
-          }
-          next.textModelProfiles = Array.from(map.values());
-        }
-        for (const k of APP_SETTINGS_FIELDS) {
-          if (k === 'textModelProfiles') continue;
-          if (incoming[k] !== undefined) next[k] = incoming[k];
-        }
-      }
-
-      useAppStore.setState(next as any);
-
-      // Reconstruct whole projects + chapters (text bodies + illustrations) into the SQLite DB.
-      let importedProjects = 0;
-      const projects = Array.isArray(incoming.projects)
-        ? (incoming.projects as Record<string, unknown>[])
-        : [];
-      const chaptersByProject = (incoming.chaptersByProject as Record<string, unknown[]>) || {};
-      const chapterBodies =
-        (incoming.chapterBodies as Record<string, { draft?: string; final?: string }>) || {};
-      const chapterIllustrations =
-        (incoming.chapterIllustrations as Record<string, unknown[]>) || {};
-
-      const chapters: ImportChapterFull[] = [];
-      for (const [pid, list] of Object.entries(chaptersByProject)) {
-        if (!Array.isArray(list)) continue;
-        for (const raw of list) {
-          const m = raw as Record<string, any>;
-          if (!m || typeof m.id !== 'string') continue;
-          const body = chapterBodies[m.id] || {};
-          const illus = chapterIllustrations[m.id];
-          chapters.push({
-            id: m.id,
-            // The chaptersByProject map key is the authoritative owner — a chapter's own
-            // project_id field can be stale (pointing at a deleted project → FK failure).
-            project_id: pid || (typeof m.project_id === 'string' ? m.project_id : ''),
-            title: m.title ?? '',
-            order_index: Number(m.order_index) || 0,
-            outline_goal: m.outline_goal ?? null,
-            conflict: m.conflict ?? null,
-            twist: m.twist ?? null,
-            cliffhanger: m.cliffhanger ?? null,
-            draft_text: body.draft ?? null,
-            final_text: body.final ?? null,
-            illustrations:
-              Array.isArray(illus) && illus.length > 0 ? JSON.stringify(illus) : null,
-            word_count: Number(m.word_count) || 0,
-            status: m.status ?? null,
-            created_at: m.created_at ?? null,
-            updated_at: m.updated_at ?? null,
-            arc_id: m.arcId ?? m.arc_id ?? null,
-          });
-        }
-      }
-
-      if (projects.length > 0 || chapters.length > 0) {
-        console.info(`[Backup] importing ${projects.length} projects, ${chapters.length} chapters`);
-        await projectApi.importContent({ projects, chapters });
-        importedProjects = projects.length;
-        // Refresh the in-memory project list so Home / Long-novel lists update immediately.
-        const all = await projectApi.getAll();
-        useAppStore.getState().setProjects(all);
-      }
-
-      const merged = importPreview.summary.projectIdsInBackup;
+      const receipt = await importBackupAtomically(importPreview.file, importIncludeAppSettings);
       setImportPreview(null);
-      setBackupStatus(
-        tx(uiLanguage,
-          `导入完成：合并了 ${merged} 个项目${importedProjects > 0 ? `（其中 ${importedProjects} 本正文已写入书库）` : ''}。${importIncludeAppSettings ? '应用设置已覆盖。' : ''}建议刷新页面以确保 UI 同步。`,
-          `Import done: merged ${merged} projects${importedProjects > 0 ? ` (${importedProjects} written to the library)` : ''}.${importIncludeAppSettings ? ' App settings overwritten.' : ''} Reload the page to make sure the UI is in sync.`)
-      );
-    } catch (err) {
-      console.error('[Backup] import failed:', err);
-      const msg = err instanceof Error ? err.message : String(err);
-      setBackupStatus(
-        tx(uiLanguage, `导入失败：${msg}`, `Import failed: ${msg}`)
-      );
-    } finally {
-      setIsImporting(false);
-    }
+      setBackupStatus(tx(uiLanguage,
+        `导入完成：${receipt.importedProjects} 个项目、${receipt.importedChapters} 个章节。外来任务不会自动续写；本机设置${importIncludeAppSettings ? '已按选择更新' : '保持不变'}。`,
+        `Imported ${receipt.importedProjects} projects and ${receipt.importedChapters} chapters. Imported tasks will not resume automatically. Local settings ${importIncludeAppSettings ? 'updated as selected' : 'were retained'}.`));
+    } catch (error) {
+      setBackupStatus(tx(uiLanguage, `导入失败：${String(error)}`, `Import failed: ${String(error)}`));
+    } finally { setIsImporting(false); }
+  };
+
+  const handleRecoverBackup = async () => {
+    setIsImporting(true);
+    try {
+      const restored = await recoverPendingBackupMetadata();
+      if (restored) {
+        useAppStore.getState().setProjects(await projectApi.getAll());
+        useAppStore.getState().bumpChaptersVersion();
+        setImportPreview(null);
+      }
+      setBackupStatus(tx(uiLanguage, restored ? '上次导入的元数据已恢复完成。' : '没有待恢复的导入。',
+        restored ? 'The previous import metadata has been recovered.' : 'No import recovery is pending.'));
+    } catch (error) {
+      setBackupStatus(tx(uiLanguage, `恢复失败，恢复日志仍保留：${String(error)}`, `Recovery failed; the recovery journal is retained: ${String(error)}`));
+    } finally { setIsImporting(false); }
   };
 
   const buildBookSummary = async () => {
@@ -1718,18 +1380,34 @@ export function SettingsPage() {
 
           <p className="text-sm text-gray-600 dark:text-gray-400 leading-relaxed mb-4">
             {tx(uiLanguage,
-              '将所有项目的角色、剧情弧线、世界观、时间线、境界系统等元数据导出为 JSON 文件。⚠ 章节正文不在备份里（它们存在 SQLite 数据库中、由 app 自动管理）。\n建议每次发布新版本前先「导出」，安装新版后再「导入」——这样可以避免 dev / 生产构建之间数据不互通的问题。',
-              'Export all project metadata (characters, arcs, world setting, timeline, realm system, etc.) as a JSON file. ⚠ Chapter content is NOT in the backup (it lives in the SQLite DB, managed automatically).\nRecommended: export before installing a new build, import after — this avoids the dev/production webview-storage split.')}
+              '备份包含完整正文、插图、角色、场景规划、写作档案和智能体会话，可与 Android 1.6.0 交换。推荐使用带附件摘要校验的 ZIP；同时支持旧版 JSON。导入先校验再确认，相同 ID 的项目或章节由备份覆盖，本机模型和 API 设置默认保持不变。',
+              'Back up complete text, illustrations, characters, scene plans, writing archives and agent sessions, compatible with Android 1.6.0. Checksummed ZIP is recommended; legacy JSON is also supported. Imports are validated before confirmation. Matching IDs are replaced; local model/API settings are retained by default.')}
           </p>
 
+          <div className="flex flex-wrap items-center gap-4 mb-3 text-sm text-gray-700 dark:text-gray-300">
+            <label className="flex items-center gap-2">
+              {tx(uiLanguage, '备份格式', 'Format')}
+              <select value={backupFormat} onChange={e => setBackupFormat(e.target.value as 'zip' | 'json')} disabled={isExporting}
+                className="rounded border bg-white dark:bg-gray-900 border-gray-300 dark:border-gray-600 px-2 py-1">
+                <option value="zip">ZIP {tx(uiLanguage, '（推荐）', '(recommended)')}</option><option value="json">JSON {tx(uiLanguage, '（旧版）', '(legacy)')}</option>
+              </select>
+            </label>
+            <label className="flex items-center gap-2 cursor-pointer">
+              <input type="checkbox" checked={exportIncludeSecrets} onChange={e => setExportIncludeSecrets(e.target.checked)} disabled={isExporting} />
+              {tx(uiLanguage, '包含 API 密钥（敏感）', 'Include API keys (sensitive)')}
+            </label>
+          </div>
           <div className="flex flex-wrap gap-3">
-            <Button onClick={handleExportBackup} variant="outline" className="whitespace-nowrap">
+            <Button onClick={handleExportBackup} variant="outline" className="whitespace-nowrap" loading={isExporting} disabled={isImporting || isReadingBackup || backupImportPending}>
               <Download className="w-4 h-4 mr-2" />
               {tx(uiLanguage, '导出全部数据', 'Export Backup')}
             </Button>
-            <Button onClick={handleImportPickFile} variant="outline" className="whitespace-nowrap">
+            <Button onClick={handleImportPickFile} variant="outline" className="whitespace-nowrap" loading={isReadingBackup} disabled={isImporting || isExporting || backupImportPending}>
               <Upload className="w-4 h-4 mr-2" />
               {tx(uiLanguage, '从备份导入', 'Import Backup')}
+            </Button>
+            <Button onClick={handleRecoverBackup} variant="outline" disabled={isImporting || isExporting || isReadingBackup}>
+              {tx(uiLanguage, '重试恢复', 'Retry recovery')}
             </Button>
           </div>
 
@@ -1741,8 +1419,8 @@ export function SettingsPage() {
 
           <p className="text-xs text-amber-700 dark:text-amber-400 mt-3 leading-relaxed">
             {tx(uiLanguage,
-              '⚠ 安全提示：导出文件包含你的 API Key 和所有项目内容。不要分享给不信任的人。',
-              '⚠ Security note: the export file contains your API keys and all project content. Do not share it with untrusted parties.')}
+              '默认移除 API 密钥，但仍包含全部书稿和私人会话，请妥善保管。导入的运行中任务会标记为已中断，不会在本机自动续写。ZIP 校验只能检测损坏，不能证明文件来源可信。',
+              'API keys are excluded by default, but private manuscripts and conversations remain. Keep backups secure. Imported running tasks are interrupted, not auto-resumed. ZIP checksums detect corruption; they do not authenticate the sender.')}
           </p>
         </div>
 
@@ -1755,7 +1433,7 @@ export function SettingsPage() {
       {importPreview && (
         <div
           className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4"
-          onClick={(e) => { if (e.target === e.currentTarget) setImportPreview(null); }}
+          onClick={(e) => { if (!isImporting && e.target === e.currentTarget) setImportPreview(null); }}
         >
           <div className="bg-white dark:bg-gray-800 rounded-xl shadow-2xl w-full max-w-md p-6 space-y-4">
             <div className="flex items-center gap-2">
@@ -1773,8 +1451,15 @@ export function SettingsPage() {
                 </span>
               )}
             </div>
+            {!Array.isArray(importPreview.file.data.projects) && importPreview.summary.chaptersInBackup === 0 && (
+              <p className="text-sm text-amber-700 dark:text-amber-400">{tx(uiLanguage, '此旧备份只包含元数据，不含正文或完整书库项目；它不能恢复文件中原本不存在的章节。', 'This legacy backup contains metadata only, not manuscript text or complete library projects. Chapters absent from the file cannot be restored.')}</p>
+            )}
 
             <div className="bg-gray-50 dark:bg-gray-900/40 rounded-lg p-3 text-sm space-y-1.5">
+              <div className="flex justify-between">
+                <span className="text-gray-600 dark:text-gray-400">{tx(uiLanguage, '章节 / 智能体会话', 'Chapters / agent sessions')}</span>
+                <span className="font-medium text-gray-900 dark:text-white">{importPreview.summary.chaptersInBackup} / {importPreview.summary.sessionsInBackup}</span>
+              </div>
               <div className="flex justify-between">
                 <span className="text-gray-600 dark:text-gray-400">
                   {tx(uiLanguage, '备份中的项目数', 'Projects in backup')}
@@ -1821,11 +1506,13 @@ export function SettingsPage() {
                 />
                 <span className="text-sm text-gray-800 dark:text-gray-200">
                   {tx(uiLanguage,
-                    '同时覆盖应用设置（API Key、文本/图像模型配置、主题、语言、KB 开关等）',
-                    'Also overwrite app settings (API keys, model configs, theme, language, KB toggles, etc.)')}
+                    '同时导入桌面端设置（模型、API、主题等）；Android 自有设置仍仅保留用于交换，不覆盖本机',
+                    'Also import desktop settings (models, API, theme, etc.). Android-only settings remain exchange data and do not overwrite this device.')}
                 </span>
               </label>
             )}
+            {backupStatus && <p role="status" className="text-sm text-amber-700 dark:text-amber-400 whitespace-pre-line">{backupStatus}</p>}
+            {backupImportPending && <Button onClick={handleRecoverBackup} variant="outline" disabled={isImporting}>{tx(uiLanguage, '重试恢复上次导入', 'Recover previous import')}</Button>}
 
             <div className="flex gap-2 justify-end pt-2">
               <Button variant="outline" onClick={() => setImportPreview(null)} disabled={isImporting}>

@@ -1,12 +1,13 @@
 {
   "name": "novelseek-ultra-pc",
   "private": true,
-  "version": "2.0.1",
+  "version": "2.1.0",
   "type": "module",
   "description": "NovelSeek Ultra — AI long-form novel writing studio (PC / Tauri)",
   "author": "NovelSeek Team",
   "scripts": {
     "dev": "vite",
+    "test": "node --test tests/*.test.mjs",
     "build": "tsc && vite build",
     "preview": "vite preview",
     "tauri": "tauri",
@@ -16,6 +17,7 @@
     "format": "prettier --write \"src/**/*.{ts,tsx,json,css}\""
   },
   "dependencies": {
+    "fflate": "0.8.2",
     "@monaco-editor/react": "^4.6.0",
     "@tauri-apps/api": "^1.5.3",
     "axios": "^1.6.7",
