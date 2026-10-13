@@ -1,8 +1,10 @@
+use super::comfy_tls::{default_http_client, normalize_base_url, ComfyRequestLease};
 use anyhow::{anyhow, Result};
 use base64::{engine::general_purpose, Engine as _};
-use reqwest::Client;
+use reqwest::{Client, StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::future::Future;
 use std::time::{Duration, Instant};
 
 /// ComfyUI HTTP client.
@@ -11,7 +13,18 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone)]
 pub struct ComfyUIClient {
     client: Client,
-    base_url: String,
+    base_url: Url,
+    lease: Option<ComfyRequestLease>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ComfyConnectionResult {
+    pub success: bool,
+    pub message: String,
+    pub normalized_url: String,
+    pub suggested_url: Option<String>,
+    pub certificate_inspection_available: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -33,42 +46,174 @@ struct HistoryImage {
 }
 
 impl ComfyUIClient {
-    pub fn new(base_url: Option<String>) -> Self {
-        let client = Client::builder()
-            .timeout(Duration::from_secs(300))
-            .connect_timeout(Duration::from_secs(10))
-            .build()
-            .unwrap_or_else(|_| Client::builder()
-                .timeout(Duration::from_secs(300))
-                .build()
-                .unwrap_or_default());
+    pub fn new(base_url: Option<String>) -> Result<Self> {
+        let url = normalize_base_url(base_url.as_deref().unwrap_or("http://localhost:8188"))?;
+        Ok(Self::from_transport(default_http_client()?, url, None))
+    }
+
+    pub(crate) fn from_transport(
+        client: Client,
+        base_url: Url,
+        lease: Option<ComfyRequestLease>,
+    ) -> Self {
         Self {
             client,
-            base_url: base_url
-                .unwrap_or_else(|| "http://localhost:8188".to_string())
-                .trim_end_matches('/')
-                .to_string(),
+            base_url,
+            lease,
         }
     }
 
-    /// Quick health check — ComfyUI exposes GET /system_stats
-    pub async fn test_connection(&self) -> Result<bool> {
-        let url = format!("{}/system_stats", self.base_url);
-        match self.client.get(&url).send().await {
-            Ok(resp) => Ok(resp.status().is_success()),
-            Err(e) => Err(anyhow!("ComfyUI connection test failed: {}", e)),
+    async fn guarded<F, T>(&self, future: F) -> Result<T>
+    where
+        F: Future<Output = Result<T>>,
+    {
+        match &self.lease {
+            Some(lease) => lease.run(future).await,
+            None => future.await,
         }
+    }
+
+    fn endpoint(&self, segments: &[&str]) -> Result<Url> {
+        let mut url = self.base_url.clone();
+        {
+            let mut path = url
+                .path_segments_mut()
+                .map_err(|_| anyhow!("ComfyUI 地址不能构造 API 路径"))?;
+            path.pop_if_empty();
+            for segment in segments {
+                if *segment == "." || *segment == ".." {
+                    return Err(anyhow!("ComfyUI 返回了不安全的 API 路径字段"));
+                }
+                path.push(segment);
+            }
+        }
+        Ok(url)
+    }
+
+    /// A successful status alone is not proof of a ComfyUI API (many gateways
+    /// return a 200 login/HTML page). Require its actual system/devices payload.
+    pub async fn test_connection(&self) -> Result<bool> {
+        let diagnostic = self.diagnose_connection().await;
+        if diagnostic.success {
+            Ok(true)
+        } else {
+            Err(anyhow!(diagnostic.message))
+        }
+    }
+
+    pub async fn diagnose_connection(&self) -> ComfyConnectionResult {
+        let mut result = ComfyConnectionResult {
+            success: false,
+            message: String::new(),
+            normalized_url: self.base_url.as_str().trim_end_matches('/').to_owned(),
+            suggested_url: None,
+            certificate_inspection_available: false,
+        };
+        let check = async {
+            let url = self.endpoint(&["system_stats"])?;
+            let response = self
+                .guarded(async {
+                    Ok(self
+                        .client
+                        .get(url)
+                        .timeout(Duration::from_secs(15))
+                        .send()
+                        .await?)
+                })
+                .await?;
+            let status = response.status();
+            let bytes = self
+                .guarded(async {
+                    let mut response = response;
+                    let mut bytes = Vec::new();
+                    while let Some(chunk) = response.chunk().await? {
+                        if bytes.len() + chunk.len() > 1_048_576 {
+                            return Err(anyhow!("ComfyUI 连接诊断响应过大"));
+                        }
+                        bytes.extend_from_slice(&chunk);
+                    }
+                    Ok(bytes)
+                })
+                .await?;
+            Ok::<_, anyhow::Error>((status, bytes))
+        }
+        .await;
+        match check {
+            Ok((status, bytes)) => {
+                let body = String::from_utf8_lossy(&bytes);
+                if status != StatusCode::OK {
+                    if self.base_url.scheme() == "http"
+                        && (status == StatusCode::NOT_IMPLEMENTED
+                            || body.to_ascii_lowercase().contains("https")
+                            || status.is_redirection())
+                    {
+                        let mut suggested = self.base_url.clone();
+                        if suggested.set_scheme("https").is_ok() {
+                            result.suggested_url =
+                                Some(suggested.as_str().trim_end_matches('/').to_owned());
+                        }
+                        result.message = format!("连接未通过（HTTP {}）。隧道可能要求 HTTPS；请明确切换地址并核对证书，程序不会自动信任或降级。", status.as_u16());
+                    } else if status.is_redirection() {
+                        result.message = format!("服务器返回重定向（HTTP {}），未跟随。请填写最终 ComfyUI 地址，避免授权发送到其他服务器。", status.as_u16());
+                    } else {
+                        result.message = format!(
+                            "ComfyUI 接口返回 HTTP {}，请检查隧道、服务器与反向代理配置。",
+                            status.as_u16()
+                        );
+                    }
+                } else if serde_json::from_slice::<Value>(&bytes)
+                    .ok()
+                    .map(|v| {
+                        v.get("system").map(Value::is_object).unwrap_or(false)
+                            && v.get("devices").map(Value::is_array).unwrap_or(false)
+                    })
+                    .unwrap_or(false)
+                {
+                    result.success = true;
+                    result.message =
+                        "连接成功：已识别 ComfyUI API；模型和工作流兼容性需在生成时验证。"
+                            .to_owned();
+                } else {
+                    result.message = "服务器返回内容不是 ComfyUI API；请检查是否连接到了登录页面、错误端口或代理网关。".to_owned();
+                }
+            }
+            Err(error) => {
+                let detail = format!("{:#}", error);
+                let lower = detail.to_ascii_lowercase();
+                if lower.contains("撤销") || lower.contains("替换") {
+                    result.message = detail;
+                } else if self.base_url.scheme() == "https"
+                    && (lower.contains("certificate")
+                        || lower.contains("证书")
+                        || lower.contains("ssl")
+                        || lower.contains("tls"))
+                {
+                    result.certificate_inspection_available = true;
+                    result.message = format!("HTTPS 证书验证失败。自签名证书需先独立核对完整 SHA-256 再授权；域名不匹配、过期或证书变化不能忽略。 {}", detail);
+                } else if lower.contains("dns")
+                    || lower.contains("resolve")
+                    || lower.contains("getaddrinfo")
+                {
+                    result.message =
+                        "无法解析 ComfyUI 域名，请检查地址和网络 DNS 设置。".to_owned();
+                } else if lower.contains("timed out") || lower.contains("timeout") {
+                    result.message =
+                        "连接 ComfyUI 超时，请检查公网端口、隧道状态和服务器是否正在运行。"
+                            .to_owned();
+                } else {
+                    result.message = format!(
+                        "无法连接 ComfyUI，请检查地址、端口、网络与隧道。 {}",
+                        detail
+                    );
+                }
+            }
+        }
+        result
     }
 
     /// Build the ComfyUI API-format prompt for the z-image-turbo workflow.
     /// LoRA node (48) is skipped; UNETLoader connects directly to ModelSamplingAuraFlow.
-    fn build_prompt(
-        &self,
-        positive: &str,
-        negative: &str,
-        width: u32,
-        height: u32,
-    ) -> Value {
+    fn build_prompt(&self, positive: &str, negative: &str, width: u32, height: u32) -> Value {
         let seed: u64 = rand_seed();
         json!({
             // Step 1 – Load models
@@ -170,19 +315,23 @@ impl ComfyUIClient {
         let prompt = self.build_prompt(positive, negative, width, height);
         let body = json!({ "prompt": prompt });
 
-        let url = format!("{}/prompt", self.base_url);
+        let url = self.endpoint(&["prompt"])?;
         let resp = self
-            .client
-            .post(&url)
-            .header("Content-Type", "application/json")
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| anyhow!("ComfyUI /prompt request failed: {}", e))?;
+            .guarded(async {
+                Ok(self
+                    .client
+                .post(url)
+                    .header("Content-Type", "application/json")
+                    .json(&body)
+                    .send()
+                    .await
+                    .map_err(|e| anyhow!("ComfyUI /prompt request failed: {:#}", e))?)
+            })
+            .await?;
 
         if !resp.status().is_success() {
             let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
+            let text = self.guarded(async { Ok(resp.text().await?) }).await?;
             // Try to extract a friendly error from ComfyUI's node validation JSON
             if let Ok(json_err) = serde_json::from_str::<Value>(&text) {
                 let main_msg = json_err
@@ -212,10 +361,21 @@ impl ComfyUIClient {
             return Err(anyhow!("ComfyUI /prompt 错误 ({}): {}", status, text));
         }
 
-        let data: PromptResponse = resp
-            .json()
-            .await
-            .map_err(|e| anyhow!("Failed to parse ComfyUI prompt response: {}", e))?;
+        let data: PromptResponse = self
+            .guarded(async {
+                Ok(resp
+                    .json()
+                    .await
+                    .map_err(|e| anyhow!("Failed to parse ComfyUI prompt response: {}", e))?)
+            })
+            .await?;
+
+        if data.prompt_id.is_empty()
+            || data.prompt_id.len() > 256
+            || data.prompt_id.chars().any(char::is_control)
+        {
+            return Err(anyhow!("ComfyUI 返回无效任务标识"));
+        }
 
         Ok(data.prompt_id)
     }
@@ -223,7 +383,7 @@ impl ComfyUIClient {
     /// Poll GET /history/{prompt_id} until the job finishes or times out.
     /// Returns the list of output images.
     async fn poll_until_done(&self, prompt_id: &str) -> Result<Vec<HistoryImage>> {
-        let url = format!("{}/history/{}", self.base_url, prompt_id);
+        let url = self.endpoint(&["history", prompt_id])?;
         let timeout = Duration::from_secs(300);
         let interval = Duration::from_millis(1500);
         let start = Instant::now();
@@ -234,16 +394,31 @@ impl ComfyUIClient {
             }
 
             let resp = self
-                .client
-                .get(&url)
-                .send()
-                .await
-                .map_err(|e| anyhow!("ComfyUI /history poll failed: {}", e))?;
+                .guarded(async {
+                    Ok(self
+                        .client
+                        .get(url.clone())
+                        .send()
+                        .await
+                        .map_err(|e| anyhow!("ComfyUI /history poll failed: {:#}", e))?)
+                })
+                .await?;
 
-            let history: Value = resp
-                .json()
-                .await
-                .map_err(|e| anyhow!("Failed to parse history response: {}", e))?;
+            if !resp.status().is_success() {
+                return Err(anyhow!(
+                    "ComfyUI /history 返回 HTTP {}",
+                    resp.status().as_u16()
+                ));
+            }
+
+            let history: Value = self
+                .guarded(async {
+                    Ok(resp
+                        .json()
+                        .await
+                        .map_err(|e| anyhow!("Failed to parse history response: {}", e))?)
+                })
+                .await?;
 
             if let Some(entry) = history.get(prompt_id) {
                 let status_node = entry.get("status");
@@ -294,12 +469,9 @@ impl ComfyUIClient {
                         .map(|arr| {
                             arr.iter()
                                 .filter_map(|img| {
-                                    let filename =
-                                        img.get("filename")?.as_str()?.to_string();
-                                    let subfolder =
-                                        img.get("subfolder")?.as_str()?.to_string();
-                                    let image_type =
-                                        img.get("type")?.as_str()?.to_string();
+                                    let filename = img.get("filename")?.as_str()?.to_string();
+                                    let subfolder = img.get("subfolder")?.as_str()?.to_string();
+                                    let image_type = img.get("type")?.as_str()?.to_string();
                                     Some(HistoryImage {
                                         filename,
                                         subfolder,
@@ -311,36 +483,46 @@ impl ComfyUIClient {
                         .unwrap_or_default();
 
                     if images.is_empty() {
-                        return Err(anyhow!("ComfyUI 任务完成但无输出图片，请检查 SaveImage 节点（id=9）"));
+                        return Err(anyhow!(
+                            "ComfyUI 任务完成但无输出图片，请检查 SaveImage 节点（id=9）"
+                        ));
                     }
                     return Ok(images);
                 }
             }
 
-            tokio::time::sleep(interval).await;
+            self.guarded(async {
+                tokio::time::sleep(interval).await;
+                Ok(())
+            })
+            .await?;
         }
     }
 
     /// Download image bytes from ComfyUI /view endpoint.
     /// Retries up to 3 times to handle stale keep-alive connections (Windows error 10053).
     async fn download_image(&self, img: &HistoryImage) -> Result<Vec<u8>> {
-        let url = format!(
-            "{}/view?filename={}&subfolder={}&type={}",
-            self.base_url,
-            urlencoding::encode(&img.filename),
-            urlencoding::encode(&img.subfolder),
-            urlencoding::encode(&img.image_type),
-        );
+        let mut url = self.endpoint(&["view"])?;
+        url.query_pairs_mut()
+            .append_pair("filename", &img.filename)
+            .append_pair("subfolder", &img.subfolder)
+            .append_pair("type", &img.image_type);
 
         let max_retries: u32 = 3;
         let mut last_err = String::new();
 
         for attempt in 0..max_retries {
             if attempt > 0 {
-                tokio::time::sleep(Duration::from_millis(800 * u64::from(attempt))).await;
+                self.guarded(async {
+                    tokio::time::sleep(Duration::from_millis(800 * u64::from(attempt))).await;
+                    Ok(())
+                })
+                .await?;
             }
 
-            let send_result = self.client.get(&url).send().await;
+            let send_result = self
+                .guarded(async { Ok(self.client.get(url.clone()).send().await?) })
+                .await;
             let resp = match send_result {
                 Err(e) => {
                     last_err = e.to_string();
@@ -353,7 +535,7 @@ impl ComfyUIClient {
                 return Err(anyhow!("ComfyUI /view error ({})", resp.status()));
             }
 
-            match resp.bytes().await {
+            match self.guarded(async { Ok(resp.bytes().await?) }).await {
                 Err(e) => {
                     last_err = e.to_string();
                     continue;
@@ -362,7 +544,11 @@ impl ComfyUIClient {
             }
         }
 
-        Err(anyhow!("ComfyUI /view request failed after {} retries: {}", max_retries, last_err))
+        Err(anyhow!(
+            "ComfyUI /view request failed after {} retries: {}",
+            max_retries,
+            last_err
+        ))
     }
 
     /// Generate an image and return it as a `data:image/png;base64,...` string.
@@ -373,7 +559,9 @@ impl ComfyUIClient {
         width: u32,
         height: u32,
     ) -> Result<String> {
-        let prompt_id = self.submit_prompt(positive, negative, width, height).await?;
+        let prompt_id = self
+            .submit_prompt(positive, negative, width, height)
+            .await?;
         let images = self.poll_until_done(&prompt_id).await?;
         let first = images
             .into_iter()

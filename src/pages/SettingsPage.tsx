@@ -5,6 +5,8 @@ import { readBackup, writeBackupJson, writeBackupZip, type BackupBundle } from '
 import { buildBackupBundle, prepareBackupImport, summarizeBackup, type BackupSummary } from '../backup/bridge';
 import { importBackupAtomically, recoverPendingBackupMetadata } from '../backup/service';
 import { Button } from '@components/Button';
+import { ComfyCertificateSettings } from '@components/ComfyCertificateSettings';
+import { parseComfyEndpoint } from '../comfy/settings';
 import { uiConfirm, uiAlert } from '@components/uiDialog';
 import type {
   EmbeddingConfig,
@@ -139,7 +141,7 @@ export function SettingsPage() {
   const [showPollinationsKey, setShowPollinationsKey] = useState(false);
   const [textStatus, setTextStatus] = useState<Status>('idle');
   const [pollinationsStatus, setPollinationsStatus] = useState<Status>('idle');
-  const [comfyUIStatus, setComfyUIStatus] = useState<Status>('idle');
+  const [comfyMutationBusy, setComfyMutationBusy] = useState(false);
 
   // Knowledge base local state
   const [localKnowledgeBaseEnabled, setLocalKnowledgeBaseEnabled] = useState(knowledgeBaseEnabled);
@@ -304,19 +306,6 @@ export function SettingsPage() {
     }
   };
 
-  const testComfyUI = async () => {
-    setComfyUIStatus('testing');
-    try {
-      const { invoke } = await import('@tauri-apps/api/tauri');
-      const result = await invoke<boolean>('test_comfyui_connection', {
-        comfyuiUrl: localComfyUIUrl.trim() || undefined,
-      });
-      setComfyUIStatus(result ? 'success' : 'error');
-    } catch {
-      setComfyUIStatus('error');
-    }
-  };
-
   const isEmbeddingConfigValid = (cfg: EmbeddingConfig): boolean =>
     cfg.apiKey.trim().length > 0 &&
     cfg.apiUrl.trim().length > 0 &&
@@ -420,6 +409,12 @@ export function SettingsPage() {
   };
 
   const saveSettings = () => {
+    const comfyEndpoint = parseComfyEndpoint(localComfyUIUrl);
+    if (comfyMutationBusy) return;
+    if (localImageEngine === 'comfyui' && !comfyEndpoint) {
+      notify(tx(uiLanguage, '请先填写有效的 ComfyUI 服务基址，不要包含登录凭据、查询参数或 # 片段。', 'Enter a valid ComfyUI base URL without credentials, query or fragment.'));
+      return;
+    }
     if (!activeProfile || !isProfileConfigValid(activeProfile)) {
       notify(
         tx(
@@ -445,7 +440,7 @@ export function SettingsPage() {
     setTextModelConfig(toTextConfig(normalizedActive));
     setPollinationsKey(localPollinationsKey.trim());
     setImageEngine(localImageEngine);
-    setComfyUIUrl(localComfyUIUrl.trim() || 'http://localhost:8188');
+    setComfyUIUrl(comfyEndpoint?.normalizedUrl ?? comfyUIUrl);
     setKnowledgeBaseEnabled(localKnowledgeBaseEnabled);
     setEmbeddingConfig(localEmbeddingConfig);
     setSummariesEnabled(localSummariesEnabled);
@@ -988,11 +983,13 @@ export function SettingsPage() {
             <span className="font-medium text-gray-800 dark:text-gray-200">ComfyUI</span>
 
             <div>
-              <label className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
+              <label htmlFor="comfyui-server-url" className="block text-sm font-medium text-gray-700 dark:text-gray-300 mb-1">
                 {tx(uiLanguage, '服务地址', 'Server URL')}
               </label>
               <input
+                id="comfyui-server-url"
                 value={localComfyUIUrl}
+                disabled={comfyMutationBusy}
                 onChange={(event) => setLocalComfyUIUrl(event.target.value)}
                 placeholder="http://localhost:8188"
                 className="w-full px-3 py-2 border rounded-lg shadow-sm focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-transparent dark:bg-gray-800 dark:border-gray-600 dark:text-white"
@@ -1007,23 +1004,17 @@ export function SettingsPage() {
               )}
             </p>
 
-            <div className="flex items-center space-x-2">
-              <Button onClick={testComfyUI} loading={comfyUIStatus === 'testing'}>
-                {tx(uiLanguage, '测试 ComfyUI 连接', 'Test ComfyUI')}
-              </Button>
-              {comfyUIStatus === 'success' && (
-                <div className="flex items-center text-green-600 dark:text-green-400">
-                  <CheckCircle className="w-4 h-4 mr-1" />
-                  <span className="text-sm">{tx(uiLanguage, '连接成功', 'Connected')}</span>
-                </div>
-              )}
-              {comfyUIStatus === 'error' && (
-                <div className="flex items-center text-red-600 dark:text-red-400">
-                  <XCircle className="w-4 h-4 mr-1" />
-                  <span className="text-sm">{tx(uiLanguage, '连接失败，请确认 ComfyUI 已启动', 'Connection failed. Ensure ComfyUI is running.')}</span>
-                </div>
-              )}
-            </div>
+            <ComfyCertificateSettings
+              baseUrl={localComfyUIUrl}
+              appliedUrl={comfyUIUrl}
+              uiLanguage={uiLanguage}
+              onChangeUrl={setLocalComfyUIUrl}
+              onMutationBusy={setComfyMutationBusy}
+              onApply={url => {
+                setImageEngine(localImageEngine);
+                setComfyUIUrl(url);
+              }}
+            />
           </div>
         </div>
 

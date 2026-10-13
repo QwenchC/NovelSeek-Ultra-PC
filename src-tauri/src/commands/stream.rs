@@ -1690,6 +1690,7 @@ Return strict JSON only:
 /// 图片生成：支持 Pollinations 和 ComfyUI 两种引擎
 #[tauri::command]
 pub async fn generate_promo_image(
+    trust: tauri::State<'_, std::sync::Arc<crate::api::comfy_tls::ComfyTrustService>>,
     prompt: String,
     width: Option<u32>,
     height: Option<u32>,
@@ -1702,9 +1703,7 @@ pub async fn generate_promo_image(
     let engine = engine.as_deref().unwrap_or("pollinations");
 
     if engine == "comfyui" {
-        use crate::api::ComfyUIClient;
-
-        let client = ComfyUIClient::new(comfyuiUrl);
+        let client = super::comfy::native_client(std::sync::Arc::clone(trust.inner()), comfyuiUrl).await?;
         let w = width.unwrap_or(1024);
         let h = height.unwrap_or(1024);
         let negative = negativePrompt.unwrap_or_else(|| {

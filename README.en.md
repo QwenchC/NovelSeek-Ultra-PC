@@ -15,10 +15,12 @@ Built with `Tauri + React + TypeScript + Rust + SQLite`, it runs fully local wit
 
 ## Version
 
-- Current version: `v2.1.0`
+- Current version: `v2.1.1`
 - Primary platform: Windows
 
-Version 2.1.0 adds the Android 1.6.0 scene-writing workbench, story notes, source-bound candidate review, planner/executor mode, manuscript import, EPUB/DOCX export and checksummed ZIP interchange. See [release notes](docs/RELEASE_NOTES_2.1.0.md) and [data interchange](docs/DATA_INTERCHANGE.md). Interchange is a manual backup workflow, not real-time cloud synchronization. Foreign tasks and candidate approvals are never automatically replayed.
+Version 2.1.1 ports the Android 1.6.2 ComfyUI remote HTTPS fix: independently verify the complete SHA-256 fingerprint, approve only that server on this computer, diagnose the connection, and revoke approval. Hostname and validity checks remain enabled; no owned domain or system certificate installation is needed. See the [2.1.1 Release](https://github.com/QwenchC/NovelSeek-Ultra-PC/releases/tag/v2.1.1), [release notes](docs/RELEASE_NOTES_2.1.1.md) and [connection guide](docs/COMFYUI_REMOTE.md). This update ports only the ComfyUI fix, not other Android 1.6.1 features.
+
+Version 2.1.0 adds the Android 1.6.0 scene-writing workbench, story notes, source-bound candidate review, planner/executor mode, manuscript import, EPUB/DOCX export and checksummed ZIP interchange. See [release notes](docs/RELEASE_NOTES_2.1.0.md) and [data interchange](docs/DATA_INTERCHANGE.md). Interchange is a manual backup workflow, not real-time cloud synchronization. Foreign tasks, candidate approvals and device-local certificate permissions are never automatically replayed or transferred.
 
 ## Feature Overview
 

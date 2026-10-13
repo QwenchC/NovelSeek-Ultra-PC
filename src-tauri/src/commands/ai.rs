@@ -652,9 +652,9 @@ Rules:
 
 #[tauri::command]
 pub async fn test_comfyui_connection(
+    trust: tauri::State<'_, std::sync::Arc<crate::api::comfy_tls::ComfyTrustService>>,
     #[allow(non_snake_case)] comfyuiUrl: Option<String>,
 ) -> Result<bool, String> {
-    use crate::api::ComfyUIClient;
-    let client = ComfyUIClient::new(comfyuiUrl);
+    let client = super::comfy::native_client(std::sync::Arc::clone(trust.inner()), comfyuiUrl).await?;
     client.test_connection().await.map_err(|e| e.to_string())
 }

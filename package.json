@@ -1,7 +1,7 @@
 {
   "name": "novelseek-ultra-pc",
   "private": true,
-  "version": "2.1.0",
+  "version": "2.1.1",
   "type": "module",
   "description": "NovelSeek Ultra — AI long-form novel writing studio (PC / Tauri)",
   "author": "NovelSeek Team",

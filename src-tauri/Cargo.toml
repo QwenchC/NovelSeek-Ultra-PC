@@ -1,6 +1,6 @@
 [package]
 name = "novelseek-ultra-pc"
-version = "2.1.0"
+version = "2.1.1"
 description = "NovelSeek Ultra — AI long-form novel writing studio (PC / Tauri)"
 authors = ["NovelSeek Team"]
 license = ""
@@ -18,7 +18,7 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1", features = ["full"] }
 sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite", "migrate"] }
-reqwest = { version = "0.11", features = ["json", "stream"] }
+reqwest = { version = "0.11", features = ["json", "stream", "rustls-tls"] }
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.7", features = ["v4", "serde"] }
 anyhow = "1.0"
@@ -35,6 +35,13 @@ base64 = "0.21"
 # Edge "Read Aloud" TTS over WebSocket (mirrors the Android EdgeTtsService mechanism).
 tokio-tungstenite = { version = "0.21", features = ["rustls-tls-webpki-roots"] }
 sha2 = "0.10"
+rustls = { version = "0.21", features = ["dangerous_configuration"] }
+tokio-rustls = "0.24"
+x509-parser = "0.16"
+tempfile = "3"
+
+[dev-dependencies]
+rustls-pemfile = "1"
 
 # Windows-only: toggle the native title bar between light/dark (DWM immersive dark mode) to match the app theme.
 [target.'cfg(windows)'.dependencies]

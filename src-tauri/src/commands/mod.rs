@@ -8,6 +8,7 @@ pub mod illustration;
 pub mod snapshot;
 pub mod tts;
 pub mod ai;
+pub mod comfy;
 pub mod stream;
 pub mod system;
 pub mod knowledge;

@@ -15,6 +15,11 @@ async fn main() {
 
     tauri::Builder::default()
         .setup(|app| {
+            // Device-local trust lives outside portable settings and the novel database.
+            let trust_root = app.path_resolver().app_local_data_dir()
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "Cannot resolve local ComfyUI certificate directory"))?
+                .join("comfy_tls_trust");
+            app.manage(std::sync::Arc::new(api::comfy_tls::ComfyTrustService::new(trust_root)));
             // Initialize database
             let app_handle = app.handle();
             tauri::async_runtime::spawn(async move {
@@ -65,6 +70,11 @@ async fn main() {
             commands::ai::test_text_connection,
             commands::ai::test_pollinations_connection,
             commands::ai::test_comfyui_connection,
+            commands::comfy::diagnose_comfyui_connection,
+            commands::comfy::comfy_get_certificate_approval,
+            commands::comfy::comfy_inspect_certificate,
+            commands::comfy::comfy_approve_certificate,
+            commands::comfy::comfy_revoke_certificate,
             commands::stream::generate_outline_stream,
             commands::stream::generate_prologue_stream,
             commands::stream::generate_chapter_stream,
